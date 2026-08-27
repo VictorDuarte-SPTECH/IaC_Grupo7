@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Buckets S3 para data lake da Lamar Auto Pecas
+
+Resources:
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: bronze-code-tracker
+      VersioningConfiguration:
+        Status: Enabled
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: silver-code-tracker
+      VersioningConfiguration:
+        Status: Enabled
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: gold-code-tracker
+      VersioningConfiguration:
+        Status: Enabled

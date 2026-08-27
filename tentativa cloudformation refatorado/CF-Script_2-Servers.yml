@@ -1,0 +1,115 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Infraestrutura de compute da Lamar Auto Pecas
+
+Parameters:
+  InstanceType:
+    Description: Tipo das instancias EC2.
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  BackendServerAZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref BackendSubnetAZ1
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+
+  BackendServerAZ2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref BackendSubnetAZ2
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+
+  DatabaseServerAZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref BackendSubnetAZ1
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+
+  WebServerAZ1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref WebSubnetAZ1
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      UserData: !Base64 |
+        #!/bin/bash
+        apt-get update -y
+        apt-get install -y apache2
+        systemctl start apache2
+        systemctl enable apache2
+        echo "<html><body><h1>Frontend AZ1</h1></body></html>" > /var/www/html/index.html
+
+  WebServerAZ2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref WebSubnetAZ2
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      UserData: !Base64 |
+        #!/bin/bash
+        apt-get update -y
+        apt-get install -y apache2
+        systemctl start apache2
+        systemctl enable apache2
+        echo "<html><body><h1>Frontend AZ2</h1></body></html>" > /var/www/html/index.html
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref SecurityGroup
+      Subnets:
+        - !Ref PublicSubnetAZ1
+        - !Ref PublicSubnetAZ2
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /
+      Targets:
+        - Id: !Ref WebServerAZ1
+          Port: 80
+        - Id: !Ref WebServerAZ2
+          Port: 80
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+Outputs:
+  ApplicationURL:
+    Description: URL publica da aplicacao.
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
