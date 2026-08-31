@@ -1,0 +1,32 @@
+services:
+  localstack:
+    image: localstack/localstack:2.0.2   # versão estável gratuita
+    container_name: estoque-autopecas-localstack
+
+    ports:
+      - "4566:4566"
+
+    environment:
+      - SERVICES=ec2,elasticloadbalancing,s3,cloudwatch,sns,iam
+      - AWS_DEFAULT_REGION=us-east-1
+      - DEBUG=0
+      - PERSISTENCE=1
+      - LS_LOG=warn
+
+    volumes:
+      - "./.localstack:/var/lib/localstack"
+      - "/var/run/docker.sock:/var/run/docker.sock"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+    networks:
+      - localstack-network
+
+networks:
+  localstack-network:
+    driver: bridge
