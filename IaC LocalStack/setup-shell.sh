@@ -717,7 +717,7 @@ echo "  Database B: ${DATABASE_B_INSTANCE}"
 # --------------------------------------------------
 
 echo ""
-echo "[10/13] Criando volumes EBS para os bancos..."
+echo "[10/13] Criando volume EBS para zona B..."
 
 
 # EBS_A_ID=$(aws_local ec2 create-volume \
@@ -740,7 +740,7 @@ EBS_B_ID=$(aws_local ec2 create-volume \
     --output text)
 
 
-echo "EBS A: ${EBS_A_ID}"
+# echo "EBS A: ${EBS_A_ID}"
 echo "EBS B: ${EBS_B_ID}"
 
 
@@ -801,31 +801,37 @@ aws_local sns subscribe \
 
 
 # --------------------------------------------------
-# --- 13. CLOUDWATCH ---
+# --- 13. CLOUDWATCH: Monitoramento do EBS ---
 # --------------------------------------------------
 
 echo ""
-echo "[13/13] Criando métricas e alarmes no CloudWatch..."
+echo "[13/13] Criando métricas e alarmes no CloudWatch para o EBS..."
 
-# Criar uma métrica customizada
+# Simula que o volume está 70% cheio
 aws_local cloudwatch put-metric-data \
-    --namespace "EstoqueAutopecas" \
-    --metric-name "RequestsBackend" \
-    --value 1 \
-    --unit Count
+    --namespace "EstoqueAutopecas/EBS" \
+    --metric-name "PercentUsed" \
+    --dimensions Volume=ebs-database-b \
+    --value 70 \
+    --unit Percent
 
-# Criar um alarme que dispara via SNS
+echo "Métrica PercentUsed publicada para EBS B."
+
+# Criar alarme que dispara se passar de 80%
 aws_local cloudwatch put-metric-alarm \
-    --alarm-name "BackendHighRequests" \
-    --metric-name "RequestsBackend" \
-    --namespace "EstoqueAutopecas" \
-    --statistic Sum \
+    --alarm-name "EBSBHighUsage" \
+    --metric-name "PercentUsed" \
+    --namespace "EstoqueAutopecas/EBS" \
+    --dimensions Name=Volume,Value=ebs-database-b \
+    --statistic Average \
     --period 60 \
-    --threshold 100 \
+    --threshold 80 \
     --comparison-operator GreaterThanThreshold \
     --evaluation-periods 1 \
     --alarm-actions "${SNS_TOPIC_ARN}" \
     --output text
+
+echo "Alarme configurado: dispara se EBS B > 80%."
 
 
 
