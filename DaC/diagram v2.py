@@ -19,10 +19,10 @@ with Diagram("Arquitetura Localstack - Estoque Autopeças", show=True):
             alb = ALB("Load Balancer")
 
             with Cluster("Zona de Disponibilidade - us-east-1a"):
-                with Cluster("Subnet Pública A (10.0.0.0/28)"):
+                with Cluster("Subnet Pública A (10.0.0.0/27)"):
                     nat1 = NATGateway("NAT Gateway A")
 
-                with Cluster("Subnet Frontend A (10.0.0.32/27)"):
+                with Cluster("Subnet Frontend A (10.0.0.64/28)"):
                     route01 = RouteTable("Route Table A")
                     frontend_a = EC2("Frontend A")
 
@@ -30,10 +30,10 @@ with Diagram("Arquitetura Localstack - Estoque Autopeças", show=True):
                     backend_a = EC2("Backend A")
 
             with Cluster("Zona de Disponibilidade - us-east-1b"):
-                with Cluster("Subnet Pública B (10.0.0.16/28)"):
+                with Cluster("Subnet Pública B (10.0.0.32/27)"):
                     nat2 = NATGateway("NAT Gateway B")
 
-                with Cluster("Subnet Frontend B (10.0.0.64/27)"):
+                with Cluster("Subnet Frontend B (10.0.0.80/28)"):
                     route02 = RouteTable("Route Table B")
                     frontend_b = EC2("Frontend B")
 

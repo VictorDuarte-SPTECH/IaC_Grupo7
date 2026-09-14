@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #Autor: Victor
-#Data: 30/08/2026
-#Versão: 1.0.0
+#Data: 12/09/2026
+#Versão: 2.5.0
 
 #Modo uso: bash setup-shell.sh
 
@@ -200,7 +200,7 @@ echo "Criando subnets da us-east-1a..."
 
 PUBLIC_A_ID=$(aws_local ec2 create-subnet \
     --vpc-id "${VPC_ID}" \
-    --cidr-block "10.0.0.0/28" \
+    --cidr-block "10.0.0.0/27" \
     --availability-zone "us-east-1a" \
     --tag-specifications \
     'ResourceType=subnet,Tags=[{Key=Name,Value=subnet-publica-1a},{Key=Tier,Value=public}]' \
@@ -210,7 +210,7 @@ PUBLIC_A_ID=$(aws_local ec2 create-subnet \
 
 FRONTEND_A_ID=$(aws_local ec2 create-subnet \
     --vpc-id "${VPC_ID}" \
-    --cidr-block "10.0.0.32/27" \
+    --cidr-block "10.0.0.64/28" \
     --availability-zone "us-east-1a" \
     --tag-specifications \
     'ResourceType=subnet,Tags=[{Key=Name,Value=subnet-frontend-1a},{Key=Tier,Value=frontend}]' \
@@ -237,7 +237,7 @@ echo "Criando subnets da us-east-1b..."
 
 PUBLIC_B_ID=$(aws_local ec2 create-subnet \
     --vpc-id "${VPC_ID}" \
-    --cidr-block "10.0.0.16/28" \
+    --cidr-block "10.0.0.32/27" \
     --availability-zone "us-east-1b" \
     --tag-specifications \
     'ResourceType=subnet,Tags=[{Key=Name,Value=subnet-publica-1b},{Key=Tier,Value=public}]' \
@@ -247,7 +247,7 @@ PUBLIC_B_ID=$(aws_local ec2 create-subnet \
 
 FRONTEND_B_ID=$(aws_local ec2 create-subnet \
     --vpc-id "${VPC_ID}" \
-    --cidr-block "10.0.0.64/27" \
+    --cidr-block "10.0.0.80/28" \
     --availability-zone "us-east-1b" \
     --tag-specifications \
     'ResourceType=subnet,Tags=[{Key=Name,Value=subnet-frontend-1b},{Key=Tier,Value=frontend}]' \
@@ -268,10 +268,10 @@ BACKEND_B_ID=$(aws_local ec2 create-subnet \
 echo ""
 echo "Subnets criadas:"
 echo "  Public A:   ${PUBLIC_A_ID}  10.0.0.0/28"
-echo "  Frontend A: ${FRONTEND_A_ID}  10.0.0.32/27"
+echo "  Frontend A: ${FRONTEND_A_ID}  10.0.0.64/28"
 echo "  Backend A:  ${BACKEND_A_ID}  10.0.0.96/28"
-echo "  Public B:   ${PUBLIC_B_ID}  10.0.0.16/28"
-echo "  Frontend B: ${FRONTEND_B_ID}  10.0.0.64/27"
+echo "  Public B:   ${PUBLIC_B_ID}  10.0.0.32/27"
+echo "  Frontend B: ${FRONTEND_B_ID}  10.0.0.80/28"
 echo "  Backend B:  ${BACKEND_B_ID}  10.0.0.112/28"
 
 
@@ -708,7 +708,7 @@ echo "  Frontend A: ${FRONTEND_A_INSTANCE}"
 echo "  Frontend B: ${FRONTEND_B_INSTANCE}"
 echo "  Backend A:  ${BACKEND_A_INSTANCE}"
 echo "  Backend B:  ${BACKEND_B_INSTANCE}"
-echo "  Database A: ${DATABASE_A_INSTANCE}"
+# echo "  Database A: ${DATABASE_A_INSTANCE}"
 echo "  Database B: ${DATABASE_B_INSTANCE}"
 
 
@@ -811,27 +811,27 @@ echo "[13/13] Criando métricas e alarmes no CloudWatch para o EBS..."
 aws_local cloudwatch put-metric-data \
     --namespace "EstoqueAutopecas/EBS" \
     --metric-name "PercentUsed" \
-    --dimensions Volume=ebs-database-b \
+    --dimensions "VolumeId=${EBS_B_ID}" \
     --value 70 \
     --unit Percent
 
 echo "Métrica PercentUsed publicada para EBS B."
 
-# Criar alarme que dispara se passar de 80%
+# Criar alarme que dispara se passar de 70%
 aws_local cloudwatch put-metric-alarm \
     --alarm-name "EBSBHighUsage" \
     --metric-name "PercentUsed" \
     --namespace "EstoqueAutopecas/EBS" \
-    --dimensions Name=Volume,Value=ebs-database-b \
+    --dimensions "Name=VolumeId,Value=${EBS_B_ID}" \
     --statistic Average \
     --period 60 \
-    --threshold 80 \
-    --comparison-operator GreaterThanThreshold \
+    --threshold 70 \
+    --comparison-operator GreaterThanOrEqualToThreshold \
     --evaluation-periods 1 \
     --alarm-actions "${SNS_TOPIC_ARN}" \
     --output text
 
-echo "Alarme configurado: dispara se EBS B > 80%."
+echo "Alarme configurado: dispara se EBS B > 70%."
 
 
 

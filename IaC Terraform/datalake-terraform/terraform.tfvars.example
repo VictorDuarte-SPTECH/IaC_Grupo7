@@ -1,0 +1,8 @@
+aws_region     = "us-east-1"
+project_name   = "lamar-pecas"
+member_prefix  = "grupo01" # Mudar aqui !!! quando criar a cópia
+environment    = "dev"
+
+# Mantenha false para proteger arquivos existentes.
+# Em um laboratorio totalmente descartavel, voce pode trocar para true.
+force_destroy_buckets = false
