@@ -1,0 +1,43 @@
+# ==============================================================================
+# DATA LAKE LEGADO DA STACK PRINCIPAL — DESATIVADO
+# ==============================================================================
+# O Data Lake agora possui uma stack Terraform separada.
+# A extensão .disabled faz com que o Terraform ignore este arquivo.
+
+/*
+resource "aws_s3_bucket" "bronze" {
+  bucket = "bronze-code-tracker"
+}
+
+resource "aws_s3_bucket_versioning" "bronze" {
+  bucket = aws_s3_bucket.bronze.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket" "silver" {
+  bucket = "silver-code-tracker"
+}
+
+resource "aws_s3_bucket_versioning" "silver" {
+  bucket = aws_s3_bucket.silver.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket" "gold" {
+  bucket = "gold-code-tracker"
+}
+
+resource "aws_s3_bucket_versioning" "gold" {
+  bucket = aws_s3_bucket.gold.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+*/

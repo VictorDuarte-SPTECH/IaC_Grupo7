@@ -1,3 +1,8 @@
+# ==============================================================================
+# --- CONFIGURAÇÃO DO TERRAFORM E DO PROVIDER AWS ---
+# ==============================================================================
+# Define o provider utilizado.
+
 terraform {
   required_providers {
     aws = {
@@ -7,14 +12,21 @@ terraform {
   }
 }
 
+# Define a região padrão em que os recursos serão provisionados.
 variable "aws_region" {
   type    = string
   default = "us-east-1"
 }
 
+# Configura o provider AWS com a região recebida pela variável.
 provider "aws" {
   region = var.aws_region
 }
+
+# ==============================================================================
+# --- VARIÁVEIS GERAIS DO AMBIENTE ---
+# ==============================================================================
+# Centraliza os valores utilizados em nomes de recursos e tipos de instância.
 
 variable "environment_name" {
   type    = string
@@ -26,6 +38,11 @@ variable "instance_type" {
   default = "t3.micro"
 }
 
+# ==============================================================================
+# --- FONTES DE DADOS DA AWS ---
+# ==============================================================================
+# Consulta as zonas de disponibilidade ativas e a AMI atual do Ubuntu 24.04.
+
 data "aws_availability_zones" "available" {
   state = "available"
 }
@@ -33,6 +50,11 @@ data "aws_availability_zones" "available" {
 data "aws_ssm_parameter" "ubuntu_ami" {
   name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
 }
+
+# ==============================================================================
+# --- REDE PRINCIPAL: VPC E INTERNET GATEWAY ---
+# ==============================================================================
+# Cria a VPC do projeto e o gateway responsável pela conexão com a internet.
 
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/25"
@@ -43,6 +65,13 @@ resource "aws_vpc" "main" {
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 }
+
+# ==============================================================================
+# --- SUB-REDES PÚBLICAS, DE FRONTEND E DE BACKEND ---
+# ==============================================================================
+# Distribui as sub-redes entre as duas primeiras zonas de disponibilidade.
+# As sub-redes públicas recebem IP público automaticamente.
+# Frontend e backend permanecem em sub-redes privadas.
 
 resource "aws_subnet" "public_az1" {
   vpc_id                  = aws_vpc.main.id
@@ -82,6 +111,11 @@ resource "aws_subnet" "backend_az2" {
   cidr_block        = "10.0.0.112/28"
 }
 
+# ==============================================================================
+# --- TABELA DE ROTAS PÚBLICA ---
+# ==============================================================================
+# Direciona o tráfego externo das sub-redes públicas para o Internet Gateway.
+
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
@@ -100,6 +134,12 @@ resource "aws_route_table_association" "public_az2" {
   subnet_id      = aws_subnet.public_az2.id
   route_table_id = aws_route_table.public.id
 }
+
+# ==============================================================================
+# --- ELASTIC IPS E NAT GATEWAYS ---
+# ==============================================================================
+# Cria um endereço público e um NAT Gateway para cada zona de disponibilidade.
+# Os NAT Gateways permitem saída para a internet a partir das redes privadas.
 
 resource "aws_eip" "nat_az1" {
   domain = "vpc"
@@ -122,6 +162,12 @@ resource "aws_nat_gateway" "az2" {
   allocation_id = aws_eip.nat_az2.id
   subnet_id     = aws_subnet.public_az2.id
 }
+
+# ==============================================================================
+# --- TABELAS DE ROTAS PRIVADAS ---
+# ==============================================================================
+# Cada zona utiliza seu próprio NAT Gateway como rota padrão de saída.
+# As redes de frontend e backend da mesma zona compartilham a tabela privada.
 
 resource "aws_route_table" "private_az1" {
   vpc_id = aws_vpc.main.id
@@ -161,6 +207,11 @@ resource "aws_route_table_association" "backend_az2" {
   route_table_id = aws_route_table.private_az2.id
 }
 
+# ==============================================================================
+# --- SECURITY GROUP DO APPLICATION LOAD BALANCER ---
+# ==============================================================================
+# Permite a entrada HTTP pela internet e libera o tráfego de saída do ALB.
+
 resource "aws_security_group" "load_balancer" {
   name_prefix = "${var.environment_name}-alb-"
   description = "Permite HTTP da internet ao ALB"
@@ -180,6 +231,11 @@ resource "aws_security_group" "load_balancer" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
+
+# ==============================================================================
+# --- SECURITY GROUP DO FRONTEND ---
+# ==============================================================================
+# Aceita HTTP somente a partir do Security Group do Load Balancer.
 
 resource "aws_security_group" "web" {
   name_prefix = "${var.environment_name}-web-"
@@ -201,6 +257,11 @@ resource "aws_security_group" "web" {
   }
 }
 
+# ==============================================================================
+# --- SECURITY GROUP DO BACKEND ---
+# ==============================================================================
+# Aceita conexões na porta 8080 originadas pelo Security Group do frontend.
+
 resource "aws_security_group" "backend" {
   name_prefix = "${var.environment_name}-backend-"
   description = "Permite acesso dos frontends aos backends"
@@ -221,6 +282,11 @@ resource "aws_security_group" "backend" {
   }
 }
 
+# ==============================================================================
+# --- SECURITY GROUP DO BANCO DE DADOS ---
+# ==============================================================================
+# Aceita conexões MySQL na porta 3306 somente a partir dos backends.
+
 resource "aws_security_group" "database" {
   name_prefix = "${var.environment_name}-database-"
   description = "Permite MySQL somente a partir dos backends"
@@ -240,6 +306,12 @@ resource "aws_security_group" "database" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 }
+
+# ==============================================================================
+# --- INSTÂNCIAS EC2 DO BACKEND ---
+# ==============================================================================
+# Cria um backend em cada zona de disponibilidade.
+# O user_data instala Apache e Nginx. (A SER ALTERADO)
 
 resource "aws_instance" "backend_az1" {
   ami                    = data.aws_ssm_parameter.ubuntu_ami.value
@@ -282,6 +354,12 @@ resource "aws_instance" "backend_az2" {
     echo "<html><body><h1>Backend AZ2 - Nginx</h1></body></html>" > /var/www/html/index.nginx.html
   EOF
 }
+
+# ==============================================================================
+# --- INSTÂNCIA EC2 DO BANCO DE DADOS ---
+# ==============================================================================
+# Cria a instância do banco na segunda zona e executa o script de inicialização.
+# O user_data instala Apache, Nginx, MySQL e o agente do CloudWatch. (A SER ALTERADO)
 
 resource "aws_instance" "database_az2" {
   ami                    = data.aws_ssm_parameter.ubuntu_ami.value
@@ -333,6 +411,11 @@ resource "aws_instance" "database_az2" {
   EOF
 }
 
+# ==============================================================================
+# --- VOLUME EBS DO BANCO DE DADOS ---
+# ==============================================================================
+# Cria um volume gp3 criptografado de 20 GB e o anexa à instância do banco.
+
 resource "aws_ebs_volume" "database_data" {
   availability_zone = aws_subnet.backend_az2.availability_zone
   size              = 20
@@ -349,6 +432,12 @@ resource "aws_volume_attachment" "database_data" {
   volume_id   = aws_ebs_volume.database_data.id
   instance_id = aws_instance.database_az2.id
 }
+
+# ==============================================================================
+# --- INSTÂNCIAS EC2 DO FRONTEND ---
+# ==============================================================================
+# Cria um frontend em cada zona e executa os scripts de inicialização.
+# O user_data instala Apache, Nginx e React. (A SER ALTERADO)
 
 resource "aws_instance" "web_az1" {
   ami                    = data.aws_ssm_parameter.ubuntu_ami.value
@@ -398,6 +487,11 @@ resource "aws_instance" "web_az2" {
   EOF
 }
 
+# ==============================================================================
+# --- NOTIFICAÇÕES DE ALERTA COM SNS ---
+# ==============================================================================
+# Cria o tópico de alertas e uma assinatura de e-mail ainda mockada.
+
 resource "aws_sns_topic" "alerts" {
   name = "${var.environment_name}-alerts"
 }
@@ -407,6 +501,11 @@ resource "aws_sns_topic_subscription" "alerts_email" {
   protocol  = "email"
   endpoint  = "email.do.marcos@lamar.com" # endereço de email mockado
 }
+
+# ==============================================================================
+# --- ALARME DE OCUPAÇÃO DO DISCO ---
+# ==============================================================================
+# Dispara o tópico SNS quando a métrica de uso do disco atingir 70%.
 
 resource "aws_cloudwatch_metric_alarm" "ebs_used_percent" {
   alarm_name          = "${var.environment_name}-ebs-used-70-percent"
@@ -427,6 +526,11 @@ resource "aws_cloudwatch_metric_alarm" "ebs_used_percent" {
   }
 }
 
+# ==============================================================================
+# --- APPLICATION LOAD BALANCER ---
+# ==============================================================================
+# Cria o ALB público nas duas sub-redes públicas.
+
 resource "aws_lb" "application" {
   name               = "${var.environment_name}-alb"
   internal           = false
@@ -434,6 +538,11 @@ resource "aws_lb" "application" {
   security_groups    = [aws_security_group.load_balancer.id]
   subnets            = [aws_subnet.public_az1.id, aws_subnet.public_az2.id]
 }
+
+# ==============================================================================
+# --- TARGET GROUP DOS FRONTENDS ---
+# ==============================================================================
+# Agrupa as duas instâncias web e configura a verificação de saúde na raiz.
 
 resource "aws_lb_target_group" "web" {
   name     = "${var.environment_name}-web-tg"
@@ -458,6 +567,11 @@ resource "aws_lb_target_group_attachment" "web_az2" {
   port             = 80
 }
 
+# ==============================================================================
+# --- LISTENER HTTP DO LOAD BALANCER ---
+# ==============================================================================
+# Recebe conexões na porta 80 e as encaminha ao target group do frontend.
+
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.application.arn
   port              = 80
@@ -469,6 +583,25 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+# ==============================================================================
+# --- OUTPUTS DA INFRAESTRUTURA PRINCIPAL ---
+# ==============================================================================
+# Exibe o endereço do ALB e o IP privado atribuído à instância do banco.
+
+output "application_url" {
+  value = "http://${aws_lb.application.dns_name}"
+}
+
+output "database_private_ip" {
+  value = aws_instance.database_az2.private_ip
+}
+
+# ==============================================================================
+# --- DATA LAKE EM S3 ---
+# ==============================================================================
+# O conteúdo dos buckets vai ficar comentado porque já está gerado numa stack bem à parte.
+
+/*
 resource "aws_s3_bucket" "bronze" {
   bucket = "bronze-code-tracker"
 }
@@ -504,15 +637,14 @@ resource "aws_s3_bucket_versioning" "gold" {
     status = "Enabled"
   }
 }
+*/
 
-output "application_url" {
-  value = "http://${aws_lb.application.dns_name}"
-}
+# ==============================================================================
+# --- OUTPUTS DO DATA LAKE ---
+# ==============================================================================
+# Também serão comentados.
 
-output "database_private_ip" {
-  value = aws_instance.database_az2.private_ip
-}
-
+/*
 output "bronze_bucket" {
   value = aws_s3_bucket.bronze.id
 }
@@ -524,3 +656,4 @@ output "silver_bucket" {
 output "gold_bucket" {
   value = aws_s3_bucket.gold.id
 }
+*/

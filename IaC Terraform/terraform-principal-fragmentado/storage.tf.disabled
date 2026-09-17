@@ -1,0 +1,45 @@
+# ==============================================================================
+# DATA LAKE LEGADO DA STACK PRINCIPAL
+# ==============================================================================
+# Atenção: o Data Lake já possui uma stack Terraform separada.
+# Estes blocos foram preservados do arquivo original e ainda estão ativos.
+# Comente-os, remova-os ou renomeie este arquivo para storage.tf.disabled antes
+# de aplicar a stack principal, evitando a criação de buckets duplicados.
+
+/*
+resource "aws_s3_bucket" "bronze" {
+  bucket = "bronze-code-tracker"
+}
+
+resource "aws_s3_bucket_versioning" "bronze" {
+  bucket = aws_s3_bucket.bronze.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket" "silver" {
+  bucket = "silver-code-tracker"
+}
+
+resource "aws_s3_bucket_versioning" "silver" {
+  bucket = aws_s3_bucket.silver.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket" "gold" {
+  bucket = "gold-code-tracker"
+}
+
+resource "aws_s3_bucket_versioning" "gold" {
+  bucket = aws_s3_bucket.gold.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+*/
