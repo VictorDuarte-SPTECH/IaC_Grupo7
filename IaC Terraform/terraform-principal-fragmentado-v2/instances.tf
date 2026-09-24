@@ -7,6 +7,7 @@ resource "aws_instance" "backend_az1" {
   ami                         = data.aws_ssm_parameter.ubuntu_ami.value
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.backend_az1.id
+  associate_public_ip_address = false
   vpc_security_group_ids      = [aws_security_group.backend.id]
   iam_instance_profile        = var.instance_profile_name
   user_data_replace_on_change = true
@@ -27,6 +28,7 @@ resource "aws_instance" "backend_az2" {
   ami                         = data.aws_ssm_parameter.ubuntu_ami.value
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.backend_az2.id
+  associate_public_ip_address = false
   vpc_security_group_ids      = [aws_security_group.backend.id]
   iam_instance_profile        = var.instance_profile_name
   user_data_replace_on_change = true
@@ -51,6 +53,7 @@ resource "aws_instance" "database_az2" {
   ami                         = data.aws_ssm_parameter.ubuntu_ami.value
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.backend_az2.id
+  associate_public_ip_address = false
   vpc_security_group_ids      = [aws_security_group.database.id]
   iam_instance_profile        = var.instance_profile_name
   user_data_replace_on_change = true
@@ -168,6 +171,7 @@ resource "aws_instance" "web_az1" {
   ami                         = data.aws_ssm_parameter.ubuntu_ami.value
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.web_az1.id
+  associate_public_ip_address = false
   vpc_security_group_ids      = [aws_security_group.web.id]
   iam_instance_profile        = var.instance_profile_name
   user_data_replace_on_change = true
@@ -188,6 +192,7 @@ resource "aws_instance" "web_az2" {
   ami                         = data.aws_ssm_parameter.ubuntu_ami.value
   instance_type               = var.instance_type
   subnet_id                   = aws_subnet.web_az2.id
+  associate_public_ip_address = false
   vpc_security_group_ids      = [aws_security_group.web.id]
   iam_instance_profile        = var.instance_profile_name
   user_data_replace_on_change = true
