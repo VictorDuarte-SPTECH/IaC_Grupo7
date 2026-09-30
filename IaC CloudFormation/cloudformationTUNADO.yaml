@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Infraestrutura principal da Lamar Auto Pecas: VPC em duas zonas de
   disponibilidade, instancias EC2, volume EBS, Application Load Balancer,
-  bastion SSH e manager Docker Swarm, sem recursos de observabilidade.
+  bastion SSH, manager Docker Swarm e servico RabbitMQ dedicado, sem recursos
+  de observabilidade.
 
 Parameters:
   EnvironmentName:
@@ -33,6 +34,43 @@ Parameters:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
     Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
     Description: Parametro SSM que resolve a AMI mais recente do Ubuntu Server 24.04.
+
+  RabbitMqUser:
+    Type: String
+    Default: lamar
+    Description: Usuario da aplicacao para conexao com o RabbitMQ.
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z0-9_-]+'
+
+  RabbitMqPassword:
+    Type: String
+    NoEcho: true
+    Description: Senha da aplicacao para conexao com o RabbitMQ.
+    MinLength: 12
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+    ConstraintDescription: Use ao menos 12 caracteres sem espacos.
+
+  DatabaseName:
+    Type: String
+    Default: lamar
+    Description: Nome do banco MySQL utilizado pela aplicacao.
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
+
+  DatabaseUser:
+    Type: String
+    Default: lamar
+    Description: Usuario MySQL utilizado pelas instancias backend.
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Senha MySQL utilizada pelas instancias backend.
+    MinLength: 12
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+    ConstraintDescription: Use ao menos 12 caracteres sem espacos.
 
 Resources:
   Vpc:
@@ -375,6 +413,23 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-sg-backend'
 
+  RabbitMqSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite AMQP somente a partir dos backends
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5672
+          ToPort: 5672
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-sg-rabbitmq'
+
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -678,6 +733,55 @@ Resources:
             exit 1
           fi
 
+  RabbitMqInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - BackendSubnetAz1RouteTableAssociation
+      - PrivateDefaultRouteAz1
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref RabbitMqSecurityGroup
+            - !Ref PrivateSshSecurityGroup
+          SubnetId: !Ref BackendSubnetAz1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-rabbitmq-az1'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io openssh-server
+
+          hostnamectl set-hostname rabbitmq-az1
+          systemctl enable --now docker
+          systemctl enable --now ssh
+          usermod -aG docker ubuntu
+
+          docker volume create rabbitmq-data
+          docker run --detach \
+            --name rabbitmq \
+            --hostname rabbitmq \
+            --restart unless-stopped \
+            --publish 5672:5672 \
+            --publish 15672:15672 \
+            --health-cmd 'rabbitmq-diagnostics -q ping' \
+            --health-interval 30s \
+            --health-timeout 10s \
+            --health-retries 5 \
+            --env RABBITMQ_DEFAULT_USER='${RabbitMqUser}' \
+            --env RABBITMQ_DEFAULT_PASS='${RabbitMqPassword}' \
+            --volume rabbitmq-data:/var/lib/rabbitmq \
+            rabbitmq:4-management-alpine
+
   DatabaseDataVolume:
     Type: AWS::EC2::Volume
     Properties:
@@ -751,6 +855,22 @@ Resources:
 
           DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
           systemctl enable --now mysql
+
+          cat > /etc/mysql/mysql.conf.d/99-lamar-network.cnf <<'MYSQL_CONFIG'
+          [mysqld]
+          bind-address = 0.0.0.0
+          mysqlx-bind-address = 127.0.0.1
+          MYSQL_CONFIG
+
+          systemctl restart mysql
+
+          mysql <<'SQL'
+          CREATE DATABASE IF NOT EXISTS `${DatabaseName}`;
+          CREATE USER IF NOT EXISTS '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
+          ALTER USER '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
+          GRANT ALL PRIVILEGES ON `${DatabaseName}`.* TO '${DatabaseUser}'@'10.0.0.%';
+          FLUSH PRIVILEGES;
+          SQL
 
   DatabaseDataVolumeAttachment:
     Type: AWS::EC2::VolumeAttachment
@@ -965,3 +1085,23 @@ Outputs:
   DatabasePrivateIp:
     Description: Endereco IP privado da instancia EC2 do banco de dados.
     Value: !GetAtt DatabaseInstance.PrivateIp
+
+  DatabaseJdbcUrl:
+    Description: URL JDBC privada utilizada pelo backend.
+    Value: !Sub 'jdbc:mysql://${DatabaseInstance.PrivateIp}:3306/${DatabaseName}'
+
+  RabbitMqPrivateIp:
+    Description: Endereco IP privado da instancia EC2 do RabbitMQ.
+    Value: !GetAtt RabbitMqInstance.PrivateIp
+
+  RabbitMqAmqpEndpoint:
+    Description: Endpoint AMQP privado acessivel pelas instancias backend.
+    Value: !Sub 'amqp://${RabbitMqInstance.PrivateIp}:5672'
+
+  RabbitMqSshCommand:
+    Description: Comando base para acessar a VM RabbitMQ pelo bastion.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${RabbitMqInstance.PrivateIp}'
+
+  RabbitMqManagementTunnelCommand:
+    Description: Tunel SSH para acessar a interface RabbitMQ em http://localhost:15672.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15672:localhost:15672 ubuntu@${RabbitMqInstance.PrivateIp}'
