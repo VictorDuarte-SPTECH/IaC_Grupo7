@@ -1,0 +1,466 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Infraestrutura principal da Lamar Auto Pecas: VPC em duas zonas de
+  disponibilidade, instancias EC2, volume EBS e Application Load Balancer,
+  sem recursos de observabilidade.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: lamar-auto-pecas
+    Description: Nome base utilizado nos recursos da aplicacao.
+    MinLength: 1
+    MaxLength: 25
+    AllowedPattern: '[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?'
+    ConstraintDescription: Use apenas letras, numeros e hifens, sem hifen no inicio ou no fim.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Tipo das instancias EC2 da aplicacao e do banco.
+
+  InstanceProfileName:
+    Type: String
+    Default: LabInstanceProfile
+    Description: Nome do IAM instance profile associado as instancias EC2.
+    MinLength: 1
+
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Parametro SSM que resolve a AMI mais recente do Ubuntu Server 24.04.
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/25
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetAz1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.0/27
+      MapPublicIpOnLaunch: true
+
+  PublicSubnetAz2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.0.32/27
+      MapPublicIpOnLaunch: true
+
+  WebSubnetAz1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.64/28
+      MapPublicIpOnLaunch: false
+
+  WebSubnetAz2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.0.80/28
+      MapPublicIpOnLaunch: false
+
+  BackendSubnetAz1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.0.0.96/28
+      MapPublicIpOnLaunch: false
+
+  BackendSubnetAz2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 10.0.0.112/28
+      MapPublicIpOnLaunch: false
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAz1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAz1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetAz2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetAz2
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEipAz1:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatEipAz2:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGatewayAz1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipAz1.AllocationId
+      SubnetId: !Ref PublicSubnetAz1
+
+  NatGatewayAz2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipAz2.AllocationId
+      SubnetId: !Ref PublicSubnetAz2
+
+  PrivateRouteTableAz1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateRouteTableAz2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PrivateDefaultRouteAz1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAz1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAz1
+
+  PrivateDefaultRouteAz2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableAz2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAz2
+
+  WebSubnetAz1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnetAz1
+      RouteTableId: !Ref PrivateRouteTableAz1
+
+  BackendSubnetAz1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BackendSubnetAz1
+      RouteTableId: !Ref PrivateRouteTableAz1
+
+  WebSubnetAz2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref WebSubnetAz2
+      RouteTableId: !Ref PrivateRouteTableAz2
+
+  BackendSubnetAz2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref BackendSubnetAz2
+      RouteTableId: !Ref PrivateRouteTableAz2
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite HTTP da internet ao ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite HTTP do ALB aos frontends
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite acesso dos frontends aos backends
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref WebSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite MySQL somente a partir dos backends
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  BackendInstanceAz1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref BackendSecurityGroup
+          SubnetId: !Ref BackendSubnetAz1
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+  BackendInstanceAz2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref BackendSecurityGroup
+          SubnetId: !Ref BackendSubnetAz2
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+  DatabaseDataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !GetAtt BackendSubnetAz2.AvailabilityZone
+      Size: 20
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-database-data'
+
+  DatabaseInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref DatabaseSecurityGroup
+          SubnetId: !Ref BackendSubnetAz2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          EBS_VOLUME_ID=$(printf '%s' '${DatabaseDataVolume}' | tr -d '-')
+          DEVICE=""
+
+          for attempt in $(seq 1 60); do
+            for candidate in "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$EBS_VOLUME_ID" /dev/xvdf /dev/sdf; do
+              if [ -b "$candidate" ]; then
+                DEVICE="$candidate"
+                break 2
+              fi
+            done
+            sleep 5
+          done
+
+          if [ -z "$DEVICE" ]; then
+            echo "O volume EBS nao foi encontrado apos 300 segundos." >&2
+            exit 1
+          fi
+
+          if ! blkid "$DEVICE" >/dev/null 2>&1; then
+            mkfs.ext4 "$DEVICE"
+          fi
+
+          EBS_UUID=$(blkid -s UUID -o value "$DEVICE")
+          mkdir -p /var/lib/mysql
+
+          if ! grep -q "UUID=$EBS_UUID /var/lib/mysql " /etc/fstab; then
+            echo "UUID=$EBS_UUID /var/lib/mysql ext4 defaults,nofail 0 2" >> /etc/fstab
+          fi
+
+          mountpoint -q /var/lib/mysql || mount /var/lib/mysql
+
+          DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
+          systemctl enable --now mysql
+
+  DatabaseDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref DatabaseInstance
+      VolumeId: !Ref DatabaseDataVolume
+
+  WebInstanceAz1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref WebSecurityGroup
+          SubnetId: !Ref WebSubnetAz1
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+  WebInstanceAz2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref WebSecurityGroup
+          SubnetId: !Ref WebSubnetAz2
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-alb'
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Subnets:
+        - !Ref PublicSubnetAz1
+        - !Ref PublicSubnetAz2
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-web-tg'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref Vpc
+      HealthCheckPath: /
+      Targets:
+        - Id: !Ref WebInstanceAz1
+          Port: 80
+        - Id: !Ref WebInstanceAz2
+          Port: 80
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+Outputs:
+  ApplicationUrl:
+    Description: URL HTTP publica do Application Load Balancer.
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  DatabasePrivateIp:
+    Description: Endereco IP privado da instancia EC2 do banco de dados.
+    Value: !GetAtt DatabaseInstance.PrivateIp
