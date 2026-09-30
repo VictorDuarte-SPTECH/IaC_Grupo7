@@ -37,9 +37,16 @@ Resources:
       CidrBlock: 10.0.0.0/25
       EnableDnsSupport: true
       EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc-principal'
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-gateway-internet'
 
   InternetGatewayAttachment:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -54,6 +61,9 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       CidrBlock: 10.0.0.0/27
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-publica-az1'
 
   PublicSubnetAz2:
     Type: AWS::EC2::Subnet
@@ -62,6 +72,9 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs '']
       CidrBlock: 10.0.0.32/27
       MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-publica-az2'
 
   WebSubnetAz1:
     Type: AWS::EC2::Subnet
@@ -70,6 +83,9 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       CidrBlock: 10.0.0.64/28
       MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-web-az1'
 
   WebSubnetAz2:
     Type: AWS::EC2::Subnet
@@ -78,6 +94,9 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs '']
       CidrBlock: 10.0.0.80/28
       MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-web-az2'
 
   BackendSubnetAz1:
     Type: AWS::EC2::Subnet
@@ -86,6 +105,9 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       CidrBlock: 10.0.0.96/28
       MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-backend-az1'
 
   BackendSubnetAz2:
     Type: AWS::EC2::Subnet
@@ -94,11 +116,17 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs '']
       CidrBlock: 10.0.0.112/28
       MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-subnet-backend-az2'
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-tabela-rotas-publica'
 
   PublicDefaultRoute:
     Type: AWS::EC2::Route
@@ -125,34 +153,52 @@ Resources:
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ip-elastico-nat-az1'
 
   NatEipAz2:
     Type: AWS::EC2::EIP
     DependsOn: InternetGatewayAttachment
     Properties:
       Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ip-elastico-nat-az2'
 
   NatGatewayAz1:
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NatEipAz1.AllocationId
       SubnetId: !Ref PublicSubnetAz1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-gateway-nat-az1'
 
   NatGatewayAz2:
     Type: AWS::EC2::NatGateway
     Properties:
       AllocationId: !GetAtt NatEipAz2.AllocationId
       SubnetId: !Ref PublicSubnetAz2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-gateway-nat-az2'
 
   PrivateRouteTableAz1:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-tabela-rotas-privada-az1'
 
   PrivateRouteTableAz2:
     Type: AWS::EC2::RouteTable
     Properties:
       VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-tabela-rotas-privada-az2'
 
   PrivateDefaultRouteAz1:
     Type: AWS::EC2::Route
@@ -205,6 +251,9 @@ Resources:
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-sg-alb'
 
   WebSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -219,6 +268,9 @@ Resources:
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-sg-web'
 
   BackendSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -233,6 +285,9 @@ Resources:
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-sg-backend'
 
   DatabaseSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -247,6 +302,9 @@ Resources:
       SecurityGroupEgress:
         - IpProtocol: '-1'
           CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-sg-banco'
 
   BackendInstanceAz1:
     Type: AWS::EC2::Instance
@@ -261,6 +319,9 @@ Resources:
           GroupSet:
             - !Ref BackendSecurityGroup
           SubnetId: !Ref BackendSubnetAz1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-backend-az1'
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -285,6 +346,9 @@ Resources:
           GroupSet:
             - !Ref BackendSecurityGroup
           SubnetId: !Ref BackendSubnetAz2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-backend-az2'
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -305,7 +369,7 @@ Resources:
       Encrypted: true
       Tags:
         - Key: Name
-          Value: !Sub '${EnvironmentName}-database-data'
+          Value: !Sub '${EnvironmentName}-volume-dados-banco-az2'
 
   DatabaseInstance:
     Type: AWS::EC2::Instance
@@ -320,6 +384,9 @@ Resources:
           GroupSet:
             - !Ref DatabaseSecurityGroup
           SubnetId: !Ref BackendSubnetAz2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-banco-az2'
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
@@ -385,6 +452,9 @@ Resources:
           GroupSet:
             - !Ref WebSecurityGroup
           SubnetId: !Ref WebSubnetAz1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-web-az1'
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -409,6 +479,9 @@ Resources:
           GroupSet:
             - !Ref WebSecurityGroup
           SubnetId: !Ref WebSubnetAz2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-web-az2'
       UserData:
         Fn::Base64: |
           #!/bin/bash
@@ -431,6 +504,9 @@ Resources:
       Subnets:
         - !Ref PublicSubnetAz1
         - !Ref PublicSubnetAz2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb'
 
   WebTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -445,6 +521,9 @@ Resources:
           Port: 80
         - Id: !Ref WebInstanceAz2
           Port: 80
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-grupo-destino-web'
 
   HttpListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
