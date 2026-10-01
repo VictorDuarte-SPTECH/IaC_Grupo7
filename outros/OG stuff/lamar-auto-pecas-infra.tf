@@ -359,7 +359,7 @@ resource "aws_instance" "backend_az2" {
 # --- INSTÂNCIA EC2 DO BANCO DE DADOS ---
 # ==============================================================================
 # Cria a instância do banco na segunda zona e executa o script de inicialização.
-# O user_data instala Apache, Nginx, MySQL e o agente do CloudWatch. (A SER ALTERADO)
+# O user_data instala Apache, Nginx e MySQL. (A SER ALTERADO)
 
 resource "aws_instance" "database_az2" {
   ami                    = data.aws_ssm_parameter.ubuntu_ami.value
@@ -370,7 +370,7 @@ resource "aws_instance" "database_az2" {
   user_data = <<-EOF
     #!/bin/bash
     apt-get update -y
-    apt-get install -y apache2 nginx mysql-server amazon-cloudwatch-agent
+    apt-get install -y apache2 nginx mysql-server
 
     # Inicia e habilita Apache
     systemctl start apache2
@@ -387,27 +387,6 @@ resource "aws_instance" "database_az2" {
     echo "<html><body><h1>Database AZ2 - Apache</h1></body></html>" > /var/www/html/index.html
     echo "<html><body><h1>Database AZ2 - Nginx</h1></body></html>" > /var/www/html/index.nginx.html
 
-    # Configuração do CloudWatch Agent para métricas de disco
-    cat <<EOC > /opt/aws/amazon-cloudwatch-agent/bin/config.json
-    {
-      "metrics": {
-        "namespace": "CWAgent",
-        "metrics_collected": {
-          "disk": {
-            "measurement": [
-              {"name": "disk_used_percent", "unit": "Percent"},
-              {"name": "disk_used_bytes", "unit": "Bytes"}
-            ],
-            "resources": ["*"],
-            "ignore_fs": ["tmpfs", "devtmpfs"]
-          }
-        }
-      }
-    }
-    EOC
-
-    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-      -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
   EOF
 }
 
@@ -500,30 +479,6 @@ resource "aws_sns_topic_subscription" "alerts_email" {
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
   endpoint  = "email.do.marcos@lamar.com" # endereço de email mockado
-}
-
-# ==============================================================================
-# --- ALARME DE OCUPAÇÃO DO DISCO ---
-# ==============================================================================
-# Dispara o tópico SNS quando a métrica de uso do disco atingir 70%.
-
-resource "aws_cloudwatch_metric_alarm" "ebs_used_percent" {
-  alarm_name          = "${var.environment_name}-ebs-used-70-percent"
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  evaluation_periods  = 1
-  metric_name         = "disk_used_percent"
-  namespace           = "CWAgent"
-  period              = 60
-  statistic           = "Average"
-  threshold           = 70
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  treat_missing_data  = "missing"
-
-  dimensions = {
-    InstanceId = aws_instance.database_az2.id
-    path       = "/var/lib/mysql"
-    fstype     = "ext4"
-  }
 }
 
 # ==============================================================================

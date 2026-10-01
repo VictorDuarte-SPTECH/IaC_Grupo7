@@ -1,15 +1,15 @@
 aws_region       = "us-east-1"
 environment_name = "lamar-auto-pecas"
 instance_type    = "t3.micro"
-key_name         = "minha-chave-ec2"
+key_name         = "Urubu10000000000"
 
 # Confirme o nome com:
 # aws iam list-instance-profiles-for-role --role-name LabRole --query "InstanceProfiles[].InstanceProfileName" --output text
 instance_profile_name = "LabInstanceProfile"
 
 # Substitua os valores antes de executar terraform plan/apply.
-rabbitmq_user     = "lamar"
-rabbitmq_password = "troque-esta-senha-rabbit"
-database_name     = "lamar"
-database_user     = "lamar"
-database_password = "troque-esta-senha-mysql"
+rabbitmq_user     = "admin"
+rabbitmq_password = "admin"
+database_name     = "admin"
+database_user     = "admin"
+database_password = "urubu100"

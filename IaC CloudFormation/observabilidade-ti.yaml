@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Painel operacional e alertas para a equipe de sustentacao.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: lamar-auto-pecas
+  DatabaseInstanceId:
+    Type: AWS::EC2::Instance::Id
+  DatabaseVolumeId:
+    Type: String
+    Description: ID do volume EBS do banco de dados da stack principal.
+  RabbitMqInstanceId:
+    Type: AWS::EC2::Instance::Id
+  SwarmManagerInstanceId:
+    Type: AWS::EC2::Instance::Id
+  WebAz1InstanceId:
+    Type: AWS::EC2::Instance::Id
+  WebAz2InstanceId:
+    Type: AWS::EC2::Instance::Id
+  BackendAz1InstanceId:
+    Type: AWS::EC2::Instance::Id
+  BackendAz2InstanceId:
+    Type: AWS::EC2::Instance::Id
+  LoadBalancerFullName:
+    Type: String
+    Description: Parte do ARN apos loadbalancer/ (app/nome/id).
+  TargetGroupFullName:
+    Type: String
+    Description: Parte do ARN apos targetgroup/ (nome/id).
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email para alertas; vazio cria apenas o topico SNS.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  OperationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${EnvironmentName}-observabilidade-ti'
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref OperationsTopic
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-operacoes'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "CPU por instancia (%)", "region": "${AWS::Region}", "stat": "Average", "period": 300,
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Swarm manager"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend AZ1"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend AZ2"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Falhas de status EC2", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend AZ1"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend AZ2"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Operacoes do volume EBS do MySQL", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  ["AWS/EBS", "VolumeReadOps", "VolumeId", "${DatabaseVolumeId}", {"label": "Leituras"}],
+                  ["AWS/EBS", "VolumeWriteOps", "VolumeId", "${DatabaseVolumeId}", {"label": "Gravacoes"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Saude dos targets do ALB", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
+                "metrics": [
+                  ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}", {"label": "Saudaveis"}],
+                  ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}", {"label": "Nao saudaveis"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Erros HTTP dos targets", "region": "${AWS::Region}", "stat": "Sum", "period": 60,
+                "metrics": [
+                  ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Latencia dos targets (p95)", "region": "${AWS::Region}", "stat": "p95", "period": 60,
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}"]
+                ]
+              }
+            }
+          ]
+        }
+
+  DatabaseStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-mysql-status-ec2'
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DatabaseInstanceId
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref OperationsTopic]
+
+  UnhealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-web-targets-nao-saudaveis'
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  Http5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-web-erros-5xx'
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: TargetGroup
+          Value: !Ref TargetGroupFullName
+        - Name: LoadBalancer
+          Value: !Ref LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+Outputs:
+  DashboardName:
+    Value: !Ref OperationsDashboard
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OperationsDashboard}'
+  AlertTopicArn:
+    Value: !Ref OperationsTopic

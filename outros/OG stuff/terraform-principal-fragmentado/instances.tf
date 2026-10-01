@@ -72,7 +72,7 @@ resource "aws_instance" "database_az2" {
     usermod -aG docker ubuntu
 
     # Instalações originais preservadas para a etapa posterior de limpeza
-    apt-get install -y apache2 nginx mysql-server amazon-cloudwatch-agent
+    apt-get install -y apache2 nginx mysql-server
 
     # Inicia e habilita Apache
     systemctl start apache2
@@ -89,27 +89,6 @@ resource "aws_instance" "database_az2" {
     echo "<html><body><h1>Database AZ2 - Apache</h1></body></html>" > /var/www/html/index.html
     echo "<html><body><h1>Database AZ2 - Nginx</h1></body></html>" > /var/www/html/index.nginx.html
 
-    # Configuração do CloudWatch Agent para métricas de disco
-    cat <<EOC > /opt/aws/amazon-cloudwatch-agent/bin/config.json
-    {
-      "metrics": {
-        "namespace": "CWAgent",
-        "metrics_collected": {
-          "disk": {
-            "measurement": [
-              {"name": "disk_used_percent", "unit": "Percent"},
-              {"name": "disk_used_bytes", "unit": "Bytes"}
-            ],
-            "resources": ["*"],
-            "ignore_fs": ["tmpfs", "devtmpfs"]
-          }
-        }
-      }
-    }
-    EOC
-
-    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-      -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
   EOF
 }
 
