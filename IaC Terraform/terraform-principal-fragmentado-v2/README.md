@@ -5,28 +5,32 @@ Esta pasta contém a mesma stack principal organizada por responsabilidade:
 - `main.tf`: configuração do Terraform, provider AWS e fontes de dados;
 - `variables.tf`: variáveis de entrada;
 - `network.tf`: VPC, sub-redes, gateways, rotas e Security Groups;
-- `instances.tf`: EC2, EBS, Application Load Balancer e scripts `user_data`;
-- `observability.tf`: CloudWatch e SNS;
+- `instances.tf`: EC2, Docker Swarm, RabbitMQ, EBS, MySQL, Application Load Balancer e scripts `user_data`;
 - `storage.tf.disabled`: buckets antigos do Data Lake, preservados e ignorados;
 - `outputs.tf`: valores exibidos após o provisionamento.
 
 Todos os arquivos `.tf` desta pasta formam uma única configuração e uma única
 stack. A separação não cria módulos nem estados diferentes.
 
-## Docker
+## Docker Swarm
 
-O `user_data` das cinco instâncias EC2 agora instala o pacote `docker.io`,
-habilita o serviço Docker e adiciona o usuário `ubuntu` ao grupo `docker`.
-Nenhuma imagem é baixada e nenhum container é iniciado nesta etapa.
+O manager inicializa o cluster, publica o token de worker no Parameter Store e
+aplica labels de camada e zona aos quatro workers. As duas VMs web e as duas VMs
+backend consultam o token e entram automaticamente no cluster.
 
-Apache, Nginx, Node.js e `create-react-app` foram removidos das máquinas porque
-as aplicações serão executadas posteriormente em containers. A instância do
-banco mantém o MySQL instalado diretamente no Ubuntu.
+O manager fica em modo `drain`, portanto as aplicações devem ser implantadas nos
+workers usando as labels `tier=web`, `tier=backend`, `zone=az1` e `zone=az2`.
+O instance profile precisa permitir leitura e escrita do parâmetro
+`/<environment_name>/swarm/worker-token` no SSM Parameter Store.
 
 Alterações futuras no `user_data` substituem a respectiva EC2 para garantir que
 o novo script seja realmente executado.
 
-## Banco, EBS e observabilidade
+## RabbitMQ e banco de dados
+
+Uma VM dedicada executa `rabbitmq:4-management-alpine`, com AMQP na porta 5672.
+A interface de administração na porta 15672 não é aberta na rede; o output
+`rabbitmq_management_tunnel_command` fornece o túnel SSH pelo bastion.
 
 Na primeira inicialização da instância do banco, o `user_data`:
 
@@ -34,9 +38,11 @@ Na primeira inicialização da instância do banco, o `user_data`:
 2. formata o volume como `ext4` somente se ele ainda estiver vazio;
 3. monta o volume em `/var/lib/mysql` e registra seu UUID no `/etc/fstab`;
 4. instala e inicia o MySQL sobre esse volume;
-5. instala o pacote oficial do CloudWatch Agent;
-6. publica `disk_used_percent` no namespace `CWAgent`;
-7. permite que o alarme envie uma notificação quando o uso alcançar 70%.
+5. habilita conexões na interface privada;
+6. cria o banco e o usuário definidos nas variáveis.
+
+Esta stack não cria recursos de observabilidade, seguindo o template
+CloudFormation usado como referência.
 
 ## LabRole e instance profile
 
@@ -54,24 +60,28 @@ O valor normalmente utilizado no Learner Lab é `LabInstanceProfile`, mas o
 resultado do comando é a fonte correta para a conta atual. Coloque o nome em
 `instance_profile_name` no `terraform.tfvars`.
 
-O mesmo profile é associado às cinco EC2, permitindo o uso futuro do Systems
-Manager para diagnóstico, caso esse serviço esteja autorizado no laboratório.
+O profile é associado ao manager, aos quatro workers e ao banco. O bastion e o
+RabbitMQ não usam instance profile, assim como no CloudFormation de referência.
 
-## Alertas por e-mail
+## Acesso administrativo
 
-`alert_email` começa vazio. Nesse caso, o tópico e o alarme são criados, mas a
-assinatura de e-mail não é criada. Para receber alertas, informe um endereço
-real no `terraform.tfvars` e confirme a mensagem enviada pelo SNS.
+O bastion recebe um Elastic IP e é o único ponto de entrada SSH público. As VMs
+privadas aceitam SSH/SFTP apenas a partir do security group do bastion. Informe
+em `key_name` um par de chaves EC2 existente na região.
 
 ## Atenções antes do primeiro apply
 
 1. Confirme o `instance_profile_name` antes do `plan`.
-2. O Data Lake está desativado nesta stack; não renomeie `storage.tf.disabled`
+2. Defina `key_name`, `rabbitmq_password` e `database_password` no
+   `terraform.tfvars`.
+3. O Data Lake está desativado nesta stack; não renomeie `storage.tf.disabled`
    para `.tf`.
-3. Nenhum container é iniciado ainda. Portanto, os target groups do ALB ficarão
+4. A aplicação web não é iniciada por esta stack. Portanto, os targets do ALB ficarão
    sem aplicações saudáveis até a etapa dos containers.
-4. Dois NAT Gateways e um Application Load Balancer consomem orçamento enquanto
+5. Dois NAT Gateways e um Application Load Balancer consomem orçamento enquanto
    permanecerem provisionados.
+6. As senhas são marcadas como sensíveis na interface do Terraform, mas ficam
+   armazenadas no state. Proteja o arquivo ou backend de estado.
 
 ## Comandos iniciais
 

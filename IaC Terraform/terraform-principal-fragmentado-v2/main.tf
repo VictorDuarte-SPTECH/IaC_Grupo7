@@ -20,5 +20,5 @@ data "aws_availability_zones" "available" {
 }
 
 data "aws_ssm_parameter" "ubuntu_ami" {
-  name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+  name = var.ubuntu_ami_parameter
 }
