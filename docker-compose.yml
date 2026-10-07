@@ -1,0 +1,51 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-senha1234}
+      MYSQL_DATABASE: lamar
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  backend:
+    build:
+      context: ../BackEnd_Grupo7
+      dockerfile: Docker/Dockerfile
+    environment:
+      DB_HOST: mysql
+      DB_NAME: lamar
+      DB_USERNAME: root
+      DB_PASSWORD: ${DB_PASSWORD:-senha1234}
+    ports:
+      - "8080:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  etiquetas:
+    build:
+      context: ../Etiquetas_Grupo7
+    environment:
+      BACKEND_API_BASE_URL: http://backend:8080
+    ports:
+      - "8081:8081"
+    depends_on:
+      - backend
+
+  frontend:
+    build:
+      context: ../FrontEnd_Grupo7/codetracker
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+      - etiquetas
+
+volumes:
+  mysql_data:
