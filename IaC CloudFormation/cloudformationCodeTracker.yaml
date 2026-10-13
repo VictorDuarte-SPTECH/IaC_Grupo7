@@ -17,8 +17,20 @@ Parameters:
 
   InstanceType:
     Type: String
-    Default: t3.micro
+    Default: t3.small
     Description: Tipo das instancias EC2 da aplicacao e do banco.
+
+  DockerHubNamespace:
+    Type: String
+    Default: guilhermebarros297
+    Description: Usuario Docker Hub com as tres imagens publicas da aplicacao.
+    AllowedPattern: '[a-z0-9][a-z0-9_-]*'
+
+  ApplicationImageTag:
+    Type: String
+    Default: v1.0.0
+    Description: Tag publicada para backend, frontend e etiquetas. O frontend deve usar /api.
+    AllowedPattern: '[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}'
 
   KeyName:
     Type: AWS::EC2::KeyPair::KeyName
@@ -53,6 +65,7 @@ Parameters:
   DatabaseName:
     Type: String
     Default: lamar
+    AllowedValues: [lamar]
     Description: Nome do banco MySQL utilizado pela aplicacao.
     MinLength: 1
     AllowedPattern: '[a-zA-Z][a-zA-Z0-9_]*'
@@ -72,7 +85,125 @@ Parameters:
     AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
     ConstraintDescription: Use ao menos 12 caracteres sem espacos.
 
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    Description: Chave aleatoria compartilhada pelas replicas do backend para assinar tokens JWT.
+    MinLength: 32
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+
+Mappings:
+  Bootstrap:
+    Common:
+      Script: |
+        set -Eeuo pipefail
+        BOOTSTRAP_STAGE=apt-update
+
+        log_bootstrap() {
+          printf '[%s] [%s] %s\n' "$(date -u +%FT%TZ)" "$BOOTSTRAP_RESOURCE" "$*" >&2
+        }
+
+        signal_bootstrap() {
+          local status="$1"
+          local payload
+          payload=$(printf '{"Status":"%s","Reason":"%s: %s","UniqueId":"%s","Data":"%s"}' \
+            "$status" "$BOOTSTRAP_RESOURCE" "$BOOTSTRAP_STAGE" "$BOOTSTRAP_RESOURCE" "$BOOTSTRAP_STAGE")
+          curl --fail --silent --show-error \
+            --connect-timeout 5 --max-time 15 \
+            --retry 2 --retry-delay 2 --retry-max-time 40 \
+            --request PUT --header 'Content-Type:' \
+            --data-binary "$payload" "$BOOTSTRAP_SIGNAL_URL"
+        }
+
+        finish_bootstrap() {
+          local exit_status="$?"
+          trap - EXIT
+          if [ "$exit_status" -eq 0 ]; then
+            BOOTSTRAP_STAGE=complete
+            if ! signal_bootstrap SUCCESS; then
+              log_bootstrap 'ERRO: nao foi possivel entregar o sinal de sucesso ao CloudFormation.'
+              exit 1
+            fi
+          else
+            log_bootstrap "ERRO: bootstrap interrompido na etapa $BOOTSTRAP_STAGE (codigo $exit_status)."
+            if ! signal_bootstrap FAILURE; then
+              log_bootstrap 'ERRO: sinal de falha nao entregue; a stack dependera do timeout. Confira NAT, rotas e acesso ao S3.'
+            fi
+          fi
+          exit "$exit_status"
+        }
+        trap finish_bootstrap EXIT
+
+        update_apt() {
+          local deadline=$((SECONDS + 600))
+          local attempt=0
+          local remaining attempt_timeout retry_delay exit_status
+          while (( SECONDS < deadline )); do
+            attempt=$((attempt + 1))
+            remaining=$((deadline - SECONDS))
+            attempt_timeout=60
+            if (( remaining < attempt_timeout )); then
+              attempt_timeout=$remaining
+            fi
+            log_bootstrap "APT: tentativa $attempt, timeout $attempt_timeout segundos, janela restante $remaining segundos."
+            if timeout --signal=TERM --kill-after=5s "$attempt_timeout" \
+              apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=0 \
+                -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 \
+                -o APT::Update::Error-Mode=any update; then
+              log_bootstrap 'APT: todos os indices atualizados; iniciando instalacao.'
+              return 0
+            else
+              exit_status=$?
+              log_bootstrap "APT: tentativa $attempt falhou (codigo $exit_status); motivo registrado acima."
+            fi
+            remaining=$((deadline - SECONDS))
+            if (( remaining > 0 )); then
+              retry_delay=10
+              if (( remaining < retry_delay )); then
+                retry_delay=$remaining
+              fi
+              sleep "$retry_delay"
+            fi
+          done
+          BOOTSTRAP_STAGE=apt-update-exhausted
+          log_bootstrap 'ERRO: janela de 600 segundos do APT esgotada; nenhum pacote sera instalado.'
+          return 1
+        }
+
+        install_packages() {
+          BOOTSTRAP_STAGE=packages
+          timeout --signal=TERM --kill-after=10s 600 \
+            env DEBIAN_FRONTEND=noninteractive \
+            apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 \
+              -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+              -o DPkg::Lock::Timeout=120 install -y "$@"
+          BOOTSTRAP_STAGE=configuration
+        }
+
+        install_aws_cli() {
+          BOOTSTRAP_STAGE=aws-cli
+          curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 120 \
+            --retry 3 --retry-all-errors --retry-delay 5 --retry-max-time 180 \
+            https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+          unzip -oq /tmp/awscliv2.zip -d /tmp/awscli-install
+          /tmp/awscli-install/aws/install --update
+          BOOTSTRAP_STAGE=configuration
+        }
+
+        update_apt
+
 Resources:
+  BootstrapSignalHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  BootstrapWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    Properties:
+      Handle: !Ref BootstrapSignalHandle
+      Timeout: '3600'
+      Count: 7
+
   Vpc:
     Type: AWS::EC2::VPC
     Properties:
@@ -210,6 +341,9 @@ Resources:
 
   NatGatewayAz1:
     Type: AWS::EC2::NatGateway
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnetAz1RouteTableAssociation
     Properties:
       AllocationId: !GetAtt NatEipAz1.AllocationId
       SubnetId: !Ref PublicSubnetAz1
@@ -219,6 +353,9 @@ Resources:
 
   NatGatewayAz2:
     Type: AWS::EC2::NatGateway
+    DependsOn:
+      - PublicDefaultRoute
+      - PublicSubnetAz2RouteTableAssociation
     Properties:
       AllocationId: !GetAtt NatEipAz2.AllocationId
       SubnetId: !Ref PublicSubnetAz2
@@ -477,6 +614,10 @@ Resources:
 
   SwarmManagerInstance:
     Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT60M
     DependsOn:
       - BackendSubnetAz1RouteTableAssociation
       - PrivateDefaultRouteAz1
@@ -497,12 +638,15 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-swarm-manager-az1'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=SwarmManagerInstance
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y awscli curl docker.io openssh-server
+          install_packages ca-certificates curl unzip python3 docker.io openssh-server
+          install_aws_cli
 
           hostnamectl set-hostname swarm-manager-az1
           systemctl enable docker
@@ -535,10 +679,117 @@ Resources:
           WORKER_TOKEN=$(docker swarm join-token --quiet worker)
           aws ssm put-parameter \
             --region "$REGION" \
+            --name '/${EnvironmentName}/swarm/manager-ip' \
+            --type String \
+            --value "$PRIVATE_IP" \
+            --overwrite
+          aws ssm put-parameter \
+            --region "$REGION" \
             --name '/${EnvironmentName}/swarm/worker-token' \
             --type SecureString \
             --value "$WORKER_TOKEN" \
             --overwrite
+          aws ssm put-parameter \
+            --region "$REGION" \
+            --name '/${EnvironmentName}/swarm/stack-id' \
+            --type String \
+            --value '${AWS::StackId}' \
+            --overwrite
+
+          umask 077
+          printf '%s' '${DatabasePassword}' | docker secret create codetracker-db-password -
+          printf '%s' '${RabbitMqPassword}' | docker secret create codetracker-rabbitmq-password -
+          printf '%s' '${JwtSecret}' | docker secret create codetracker-jwt-secret -
+          mkdir -p /opt/codetracker
+
+          cat > /opt/codetracker/stack.yml <<'STACK'
+          version: '3.8'
+          services:
+            backend:
+              image: ${DockerHubNamespace}/codetracker-backend:${ApplicationImageTag}
+              environment:
+                DB_HOST: '${DatabaseInstance.PrivateIp}'
+                DB_NAME: '${DatabaseName}'
+                DB_USERNAME: '${DatabaseUser}'
+                SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
+                SPRING_RABBITMQ_HOST: '${RabbitMqInstance.PrivateIp}'
+                SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
+                JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0'
+              secrets:
+                - source: database_password
+                  target: DB_PASSWORD
+                - source: rabbitmq_password
+                  target: spring.rabbitmq.password
+                - source: jwt_secret
+                  target: JWT_SECRET
+              networks:
+                application:
+                  aliases: [backend]
+              deploy:
+                replicas: 2
+                placement:
+                  constraints: [node.labels.tier == backend]
+                  max_replicas_per_node: 1
+                resources:
+                  limits:
+                    memory: 768M
+                restart_policy:
+                  condition: any
+                  delay: 10s
+            etiquetas:
+              image: ${DockerHubNamespace}/codetracker-etiquetas:${ApplicationImageTag}
+              environment:
+                BACKEND_API_BASE_URL: 'http://backend:8080'
+                JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0'
+              networks:
+                application:
+                  aliases: [etiquetas]
+              deploy:
+                replicas: 1
+                placement:
+                  constraints: [node.labels.tier == backend]
+                resources:
+                  limits:
+                    memory: 512M
+                restart_policy:
+                  condition: any
+                  delay: 10s
+            frontend:
+              image: ${DockerHubNamespace}/codetracker-frontend:${ApplicationImageTag}
+              ports:
+                - target: 80
+                  published: 80
+                  protocol: tcp
+                  mode: host
+              networks:
+                application:
+                  aliases: [frontend]
+              deploy:
+                replicas: 2
+                placement:
+                  constraints: [node.labels.tier == web]
+                  max_replicas_per_node: 1
+                resources:
+                  limits:
+                    memory: 128M
+                restart_policy:
+                  condition: any
+                  delay: 10s
+          networks:
+            application:
+              driver: overlay
+              attachable: true
+          secrets:
+            database_password:
+              external: true
+              name: codetracker-db-password
+            rabbitmq_password:
+              external: true
+              name: codetracker-rabbitmq-password
+            jwt_secret:
+              external: true
+              name: codetracker-jwt-secret
+          STACK
 
           cat > /usr/local/sbin/label-swarm-workers <<'SCRIPT'
           #!/bin/bash
@@ -547,7 +798,7 @@ Resources:
           ALL_WORKERS_READY=true
 
           while read -r NODE_NAME TIER ZONE; do
-            NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}}' | head -n 1)
+            NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}} {{.Status}}' | awk '$2 == "Ready" && !found { print $1; found = 1 }')
 
             if [ -z "$NODE_ID" ]; then
               ALL_WORKERS_READY=false
@@ -568,13 +819,65 @@ Resources:
           if [ "$ALL_WORKERS_READY" != true ]; then
             exit 1
           fi
+
+          DATABASE_READY=false
+          for attempt in $(seq 1 120); do
+            DATABASE_STACK=$(aws ssm get-parameter \
+              --region '${AWS::Region}' \
+              --name '/${EnvironmentName}/database/ready' \
+              --query Parameter.Value --output text 2>/dev/null || true)
+            if [ "$DATABASE_STACK" = '${AWS::StackId}' ]; then
+              DATABASE_READY=true
+              break
+            fi
+            sleep 10
+          done
+          if [ "$DATABASE_READY" != true ]; then
+            echo "A importacao do banco nao foi concluida." >&2
+            exit 1
+          fi
+
+          docker stack deploy --compose-file /opt/codetracker/stack.yml codetracker
+
+          for attempt in $(seq 1 120); do
+            READY_SERVICES=$(docker service ls --filter label=com.docker.stack.namespace=codetracker \
+              --format '{{.Replicas}}' | grep -Ec '^(2/2|1/1)$' || true)
+
+            if [ "$READY_SERVICES" = 3 ]; then
+              if docker run --rm --network codetracker_application curlimages/curl:8.12.1 \
+                --fail --silent --show-error --max-time 15 http://frontend/ > /dev/null; then
+                BACKEND_STATUS=$(docker run --rm --network codetracker_application curlimages/curl:8.12.1 \
+                  --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
+                  http://frontend/api/ || true)
+                ETIQUETAS_STATUS=$(docker run --rm --network codetracker_application curlimages/curl:8.12.1 \
+                  --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
+                  http://frontend/etiquetas-api/ || true)
+
+                if [[ "$BACKEND_STATUS" =~ ^[234][0-9][0-9]$ ]] && \
+                   [[ "$ETIQUETAS_STATUS" =~ ^[234][0-9][0-9]$ ]]; then
+                  aws cloudformation signal-resource \
+                    --region '${AWS::Region}' \
+                    --stack-name '${AWS::StackId}' \
+                    --logical-resource-id SwarmManagerInstance \
+                    --unique-id swarm-manager-az1 \
+                    --status SUCCESS
+                  exit 0
+                fi
+              fi
+            fi
+
+            sleep 10
+          done
+
+          docker service ls
+          exit 1
           SCRIPT
 
           chmod 750 /usr/local/sbin/label-swarm-workers
 
           cat > /etc/systemd/system/label-swarm-workers.service <<'SERVICE'
           [Unit]
-          Description=Aplica labels aos workers do Docker Swarm
+          Description=Configura workers e publica a aplicacao no Docker Swarm
           After=docker.service
           Requires=docker.service
           StartLimitIntervalSec=0
@@ -582,6 +885,7 @@ Resources:
           [Service]
           Type=oneshot
           ExecStart=/usr/local/sbin/label-swarm-workers
+          RemainAfterExit=yes
           Restart=on-failure
           RestartSec=15
 
@@ -592,10 +896,13 @@ Resources:
           systemctl daemon-reload
           systemctl enable label-swarm-workers.service
           systemctl start label-swarm-workers.service || true
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   BackendInstanceAz1:
     Type: AWS::EC2::Instance
     DependsOn:
+      - BackendSubnetAz1RouteTableAssociation
+      - PrivateDefaultRouteAz1
       - SwarmManagementIngress
       - SwarmDiscoveryTcpIngress
       - SwarmDiscoveryUdpIngress
@@ -618,12 +925,15 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-backend-az1'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=BackendInstanceAz1
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y awscli curl docker.io openssh-server
+          install_packages ca-certificates curl unzip python3 docker.io openssh-server
+          install_aws_cli
 
           hostnamectl set-hostname backend-az1
           systemctl enable docker
@@ -641,15 +951,23 @@ Resources:
 
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
             for attempt in $(seq 1 90); do
-              if WORKER_TOKEN=$(aws ssm get-parameter \
+              if MANAGER_STACK=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/stack-id' \
+                --query Parameter.Value \
+                --output text 2>/dev/null) && [ "$MANAGER_STACK" = '${AWS::StackId}' ] && WORKER_TOKEN=$(aws ssm get-parameter \
                 --region "$REGION" \
                 --name '/${EnvironmentName}/swarm/worker-token' \
                 --with-decryption \
                 --query Parameter.Value \
+                --output text 2>/dev/null) && MANAGER_IP=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/manager-ip' \
+                --query Parameter.Value \
                 --output text 2>/dev/null); then
                 if docker swarm join \
                   --token "$WORKER_TOKEN" \
-                  '${SwarmManagerInstance.PrivateIp}:2377'; then
+                  "$MANAGER_IP:2377"; then
                   break
                 fi
               fi
@@ -663,9 +981,13 @@ Resources:
             exit 1
           fi
 
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+
   BackendInstanceAz2:
     Type: AWS::EC2::Instance
     DependsOn:
+      - BackendSubnetAz2RouteTableAssociation
+      - PrivateDefaultRouteAz2
       - SwarmManagementIngress
       - SwarmDiscoveryTcpIngress
       - SwarmDiscoveryUdpIngress
@@ -688,12 +1010,15 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-backend-az2'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=BackendInstanceAz2
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y awscli curl docker.io openssh-server
+          install_packages ca-certificates curl unzip python3 docker.io openssh-server
+          install_aws_cli
 
           hostnamectl set-hostname backend-az2
           systemctl enable docker
@@ -711,15 +1036,23 @@ Resources:
 
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
             for attempt in $(seq 1 90); do
-              if WORKER_TOKEN=$(aws ssm get-parameter \
+              if MANAGER_STACK=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/stack-id' \
+                --query Parameter.Value \
+                --output text 2>/dev/null) && [ "$MANAGER_STACK" = '${AWS::StackId}' ] && WORKER_TOKEN=$(aws ssm get-parameter \
                 --region "$REGION" \
                 --name '/${EnvironmentName}/swarm/worker-token' \
                 --with-decryption \
                 --query Parameter.Value \
+                --output text 2>/dev/null) && MANAGER_IP=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/manager-ip' \
+                --query Parameter.Value \
                 --output text 2>/dev/null); then
                 if docker swarm join \
                   --token "$WORKER_TOKEN" \
-                  '${SwarmManagerInstance.PrivateIp}:2377'; then
+                  "$MANAGER_IP:2377"; then
                   break
                 fi
               fi
@@ -732,6 +1065,8 @@ Resources:
             echo "Nao foi possivel adicionar backend-az2 ao Docker Swarm." >&2
             exit 1
           fi
+
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   RabbitMqInstance:
     Type: AWS::EC2::Instance
@@ -754,12 +1089,14 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-rabbitmq-az1'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=RabbitMqInstance
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io openssh-server
+          install_packages docker.io openssh-server ca-certificates curl
 
           hostnamectl set-hostname rabbitmq-az1
           systemctl enable --now docker
@@ -782,6 +1119,8 @@ Resources:
             --volume rabbitmq-data:/var/lib/rabbitmq \
             rabbitmq:4-management-alpine
 
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+
   DatabaseDataVolume:
     Type: AWS::EC2::Volume
     Properties:
@@ -795,6 +1134,9 @@ Resources:
 
   DatabaseInstance:
     Type: AWS::EC2::Instance
+    DependsOn:
+      - BackendSubnetAz2RouteTableAssociation
+      - PrivateDefaultRouteAz2
     Properties:
       ImageId: !Ref UbuntuAmiId
       InstanceType: !Ref InstanceType
@@ -812,15 +1154,13 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-banco-az2'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=DatabaseInstance
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
-
-          systemctl enable --now docker
-          usermod -aG docker ubuntu
 
           EBS_VOLUME_ID=$(printf '%s' '${DatabaseDataVolume}' | tr -d '-')
           DEVICE=""
@@ -852,8 +1192,10 @@ Resources:
           fi
 
           mountpoint -q /var/lib/mysql || mount /var/lib/mysql
+          rmdir /var/lib/mysql/lost+found 2>/dev/null || true
 
-          DEBIAN_FRONTEND=noninteractive apt-get install -y mysql-server
+          install_packages mysql-server git ca-certificates curl unzip
+          install_aws_cli
           systemctl enable --now mysql
 
           cat > /etc/mysql/mysql.conf.d/99-lamar-network.cnf <<'MYSQL_CONFIG'
@@ -864,6 +1206,19 @@ Resources:
 
           systemctl restart mysql
 
+          if [ ! -f /var/lib/mysql/.lamar-import-complete ]; then
+            TABLE_COUNT=$(mysql --batch --skip-column-names --execute \
+              "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '${DatabaseName}';")
+            if [ "$TABLE_COUNT" != 0 ]; then
+              echo "Banco existente sem marcador de importacao. Abortando para preservar os dados." >&2
+              exit 1
+            fi
+
+            git clone --depth 1 https://github.com/EnzoServilha/Banco_Grupo7.git /opt/Banco_Grupo7
+            mysql --default-character-set=utf8mb4 < /opt/Banco_Grupo7/SCRIPT-Lamar-AutoPecas.sql
+            git -C /opt/Banco_Grupo7 rev-parse HEAD > /var/lib/mysql/.lamar-import-complete
+          fi
+
           mysql <<'SQL'
           CREATE DATABASE IF NOT EXISTS `${DatabaseName}`;
           CREATE USER IF NOT EXISTS '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
@@ -871,6 +1226,15 @@ Resources:
           GRANT ALL PRIVILEGES ON `${DatabaseName}`.* TO '${DatabaseUser}'@'10.0.0.%';
           FLUSH PRIVILEGES;
           SQL
+
+          aws ssm put-parameter \
+            --region '${AWS::Region}' \
+            --name '/${EnvironmentName}/database/ready' \
+            --type String \
+            --value '${AWS::StackId}' \
+            --overwrite
+
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   DatabaseDataVolumeAttachment:
     Type: AWS::EC2::VolumeAttachment
@@ -882,6 +1246,8 @@ Resources:
   WebInstanceAz1:
     Type: AWS::EC2::Instance
     DependsOn:
+      - WebSubnetAz1RouteTableAssociation
+      - PrivateDefaultRouteAz1
       - SwarmManagementIngress
       - SwarmDiscoveryTcpIngress
       - SwarmDiscoveryUdpIngress
@@ -904,12 +1270,15 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-web-az1'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=WebInstanceAz1
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y awscli curl docker.io openssh-server
+          install_packages ca-certificates curl unzip python3 docker.io openssh-server
+          install_aws_cli
 
           hostnamectl set-hostname web-az1
           systemctl enable docker
@@ -927,15 +1296,23 @@ Resources:
 
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
             for attempt in $(seq 1 90); do
-              if WORKER_TOKEN=$(aws ssm get-parameter \
+              if MANAGER_STACK=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/stack-id' \
+                --query Parameter.Value \
+                --output text 2>/dev/null) && [ "$MANAGER_STACK" = '${AWS::StackId}' ] && WORKER_TOKEN=$(aws ssm get-parameter \
                 --region "$REGION" \
                 --name '/${EnvironmentName}/swarm/worker-token' \
                 --with-decryption \
                 --query Parameter.Value \
+                --output text 2>/dev/null) && MANAGER_IP=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/manager-ip' \
+                --query Parameter.Value \
                 --output text 2>/dev/null); then
                 if docker swarm join \
                   --token "$WORKER_TOKEN" \
-                  '${SwarmManagerInstance.PrivateIp}:2377'; then
+                  "$MANAGER_IP:2377"; then
                   break
                 fi
               fi
@@ -949,9 +1326,13 @@ Resources:
             exit 1
           fi
 
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+
   WebInstanceAz2:
     Type: AWS::EC2::Instance
     DependsOn:
+      - WebSubnetAz2RouteTableAssociation
+      - PrivateDefaultRouteAz2
       - SwarmManagementIngress
       - SwarmDiscoveryTcpIngress
       - SwarmDiscoveryUdpIngress
@@ -974,12 +1355,15 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-web-az2'
       UserData:
-        Fn::Base64: !Sub |
+        Fn::Base64: !Sub
+        - |
           #!/bin/bash
-          set -euxo pipefail
+          BOOTSTRAP_RESOURCE=WebInstanceAz2
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
 
-          apt-get update -y
-          DEBIAN_FRONTEND=noninteractive apt-get install -y awscli curl docker.io openssh-server
+          install_packages ca-certificates curl unzip python3 docker.io openssh-server
+          install_aws_cli
 
           hostnamectl set-hostname web-az2
           systemctl enable docker
@@ -997,15 +1381,23 @@ Resources:
 
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
             for attempt in $(seq 1 90); do
-              if WORKER_TOKEN=$(aws ssm get-parameter \
+              if MANAGER_STACK=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/stack-id' \
+                --query Parameter.Value \
+                --output text 2>/dev/null) && [ "$MANAGER_STACK" = '${AWS::StackId}' ] && WORKER_TOKEN=$(aws ssm get-parameter \
                 --region "$REGION" \
                 --name '/${EnvironmentName}/swarm/worker-token' \
                 --with-decryption \
                 --query Parameter.Value \
+                --output text 2>/dev/null) && MANAGER_IP=$(aws ssm get-parameter \
+                --region "$REGION" \
+                --name '/${EnvironmentName}/swarm/manager-ip' \
+                --query Parameter.Value \
                 --output text 2>/dev/null); then
                 if docker swarm join \
                   --token "$WORKER_TOKEN" \
-                  '${SwarmManagerInstance.PrivateIp}:2377'; then
+                  "$MANAGER_IP:2377"; then
                   break
                 fi
               fi
@@ -1018,6 +1410,8 @@ Resources:
             echo "Nao foi possivel adicionar web-az2 ao Docker Swarm." >&2
             exit 1
           fi
+
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
