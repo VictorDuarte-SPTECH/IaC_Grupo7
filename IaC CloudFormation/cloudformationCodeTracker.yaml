@@ -795,6 +795,24 @@ Resources:
           #!/bin/bash
           set -euo pipefail
 
+          signal_manager_failure() {
+            local exit_status="$?"
+            trap - EXIT
+            if (( exit_status != 0 )); then
+              echo "Falha na configuracao ou validacao da aplicacao no Swarm." >&2
+              if ! aws cloudformation signal-resource \
+                --region '${AWS::Region}' \
+                --stack-name '${AWS::StackId}' \
+                --logical-resource-id SwarmManagerInstance \
+                --unique-id swarm-manager-az1 \
+                --status FAILURE; then
+                echo "Nao foi possivel sinalizar a falha do SwarmManagerInstance ao CloudFormation." >&2
+              fi
+            fi
+            exit "$exit_status"
+          }
+          trap signal_manager_failure EXIT
+
           ALL_WORKERS_READY=true
 
           while read -r NODE_NAME TIER ZONE; do
@@ -861,6 +879,7 @@ Resources:
                     --logical-resource-id SwarmManagerInstance \
                     --unique-id swarm-manager-az1 \
                     --status SUCCESS
+                  trap - EXIT
                   exit 0
                 fi
               fi
@@ -895,7 +914,7 @@ Resources:
 
           systemctl daemon-reload
           systemctl enable label-swarm-workers.service
-          systemctl start label-swarm-workers.service || true
+          systemctl start --no-block label-swarm-workers.service
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   BackendInstanceAz1:
