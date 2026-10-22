@@ -2,7 +2,7 @@ from diagrams import Diagram, Cluster
 from diagrams.onprem.compute import Server
 from diagrams.aws.network import InternetGateway, VPC, RouteTable, NATGateway, ALB
 from diagrams.aws.compute import EC2
-from diagrams.aws.storage import S3, EBS
+from diagrams.aws.storage import EBS
 from diagrams.aws.management import Cloudwatch
 from diagrams.aws.integration import SNS
 
@@ -42,11 +42,6 @@ with Diagram("Arquitetura Localstack - Estoque Autopeças", show=True):
                     db_b = EC2("Database B")
                     ebs_b = EBS("EBS Volume B")
 
-        # Datalake S3
-        bronze = S3("Bucket Bronze")
-        silver = S3("Bucket Silver")
-        gold = S3("Bucket Gold")
-
         # Observabilidade
         cw = Cloudwatch("CloudWatch")
         sns = SNS("SNS Alertas")
@@ -58,7 +53,5 @@ with Diagram("Arquitetura Localstack - Estoque Autopeças", show=True):
         nat1 >> route01 >> frontend_a >> backend_a
         nat2 >> route02 >> frontend_b >> backend_b
         backend_b >> db_b >> ebs_b
-
-        bronze >> silver >> gold
 
         ebs_b >> cw >> sns

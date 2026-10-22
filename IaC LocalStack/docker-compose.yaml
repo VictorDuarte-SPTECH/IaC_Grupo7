@@ -7,7 +7,7 @@ services:
       - "4566:4566"
 
     environment:
-      - SERVICES=ec2,elasticloadbalancing,s3,cloudwatch,sns,iam
+      - SERVICES=ec2,elasticloadbalancing,cloudwatch,sns,iam
       - AWS_DEFAULT_REGION=us-east-1
       - DEBUG=0
       - PERSISTENCE=1

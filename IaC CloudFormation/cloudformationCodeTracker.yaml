@@ -2,8 +2,7 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Infraestrutura principal da Lamar Auto Pecas: VPC em duas zonas de
   disponibilidade, instancias EC2, volume EBS, Application Load Balancer,
-  bastion SSH, manager Docker Swarm e servico RabbitMQ dedicado, sem recursos
-  de observabilidade.
+  bastion SSH, manager Docker Swarm e servico RabbitMQ dedicado.
 
 Parameters:
   EnvironmentName:
@@ -85,12 +84,22 @@ Parameters:
     AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
     ConstraintDescription: Use ao menos 12 caracteres sem espacos.
 
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Senha inicial de admin@teste.com para o login da aplicacao (nao e a senha do MySQL).
+    MinLength: 12
+    MaxLength: 72
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+    ConstraintDescription: Use entre 12 e 72 caracteres sem espacos.
+
   JwtSecret:
     Type: String
     NoEcho: true
-    Description: Chave aleatoria compartilhada pelas replicas do backend para assinar tokens JWT.
-    MinLength: 32
-    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+    Description: Chave aleatoria Base64 (ao menos 32 bytes decodificados) compartilhada pelas replicas do backend.
+    MinLength: 44
+    AllowedPattern: '[a-zA-Z0-9+/]+={0,2}'
+    ConstraintDescription: Informe uma chave Base64 de ao menos 32 bytes decodificados.
 
 Mappings:
   Bootstrap:
@@ -172,12 +181,31 @@ Mappings:
 
         install_packages() {
           BOOTSTRAP_STAGE=packages
-          timeout --signal=TERM --kill-after=10s 600 \
-            env DEBIAN_FRONTEND=noninteractive \
-            apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 \
-              -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
-              -o DPkg::Lock::Timeout=120 install -y "$@"
-          BOOTSTRAP_STAGE=configuration
+          local deadline=$((SECONDS + 600))
+          local attempt=0
+          local remaining exit_status
+          while (( SECONDS < deadline )); do
+            attempt=$((attempt + 1))
+            remaining=$((deadline - SECONDS))
+            log_bootstrap "APT install: tentativa $attempt, janela restante $remaining segundos."
+            if timeout --signal=TERM --kill-after=10s "$remaining" \
+              env DEBIAN_FRONTEND=noninteractive \
+              apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 \
+                -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 \
+                -o DPkg::Lock::Timeout=120 install -y "$@"; then
+              BOOTSTRAP_STAGE=configuration
+              return 0
+            else
+              exit_status=$?
+              log_bootstrap "APT install: tentativa $attempt falhou (codigo $exit_status)."
+            fi
+            remaining=$((deadline - SECONDS))
+            if (( remaining > 0 )); then
+              sleep 10
+            fi
+          done
+          log_bootstrap 'ERRO: janela de 600 segundos da instalacao esgotada.'
+          return "$exit_status"
         }
 
         install_aws_cli() {
@@ -202,7 +230,7 @@ Resources:
     Properties:
       Handle: !Ref BootstrapSignalHandle
       Timeout: '3600'
-      Count: 7
+      Count: 8
 
   Vpc:
     Type: AWS::EC2::VPC
@@ -586,10 +614,12 @@ Resources:
 
   BastionInstance:
     Type: AWS::EC2::Instance
-    DependsOn: InternetGatewayAttachment
+    DependsOn:
+      - PublicDefaultRoute
     Properties:
       ImageId: !Ref UbuntuAmiId
       InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
         - AssociatePublicIpAddress: false
@@ -601,6 +631,15 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-bastion-az1'
+      UserData:
+        Fn::Base64: !Sub
+        - |
+          #!/bin/bash
+          BOOTSTRAP_RESOURCE=BastionInstance
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
+
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   BastionEip:
     Type: AWS::EC2::EIP
@@ -666,7 +705,7 @@ Resources:
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["region"])')
 
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
-            docker swarm init --advertise-addr "$PRIVATE_IP"
+            docker swarm init --advertise-addr "$PRIVATE_IP" > /dev/null
           fi
 
           MANAGER_NODE_ID=$(docker info --format '{{.Swarm.NodeID}}')
@@ -726,10 +765,11 @@ Resources:
                 application:
                   aliases: [backend]
               deploy:
-                replicas: 2
+                replicas: 4
+                endpoint_mode: vip
                 placement:
                   constraints: [node.labels.tier == backend]
-                  max_replicas_per_node: 1
+                  max_replicas_per_node: 2
                 resources:
                   limits:
                     memory: 768M
@@ -813,33 +853,44 @@ Resources:
           }
           trap signal_manager_failure EXIT
 
-          ALL_WORKERS_READY=true
+          WORKERS_READY=false
+          for attempt in $(seq 1 60); do
+            ALL_WORKERS_READY=true
 
-          while read -r NODE_NAME TIER ZONE; do
-            NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}} {{.Status}}' | awk '$2 == "Ready" && !found { print $1; found = 1 }')
+            while read -r NODE_NAME TIER ZONE; do
+              NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}} {{.Status}}' | awk '$2 == "Ready" && !found { print $1; found = 1 }')
 
-            if [ -z "$NODE_ID" ]; then
-              ALL_WORKERS_READY=false
-              continue
-            fi
+              if [ -z "$NODE_ID" ]; then
+                ALL_WORKERS_READY=false
+                continue
+              fi
 
-            docker node update \
-              --label-add "tier=$TIER" \
-              --label-add "zone=$ZONE" \
-              "$NODE_ID"
-          done <<'NODES'
+              docker node update \
+                --label-add "tier=$TIER" \
+                --label-add "zone=$ZONE" \
+                "$NODE_ID"
+            done <<'NODES'
           web-az1 web az1
           web-az2 web az2
           backend-az1 backend az1
           backend-az2 backend az2
           NODES
 
-          if [ "$ALL_WORKERS_READY" != true ]; then
+            if [ "$ALL_WORKERS_READY" = true ]; then
+              WORKERS_READY=true
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$WORKERS_READY" != true ]; then
+            echo "Os quatro workers nao ficaram prontos no Swarm apos 10 minutos." >&2
+            docker node ls >&2
             exit 1
           fi
 
           DATABASE_READY=false
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 90); do
             DATABASE_STACK=$(aws ssm get-parameter \
               --region '${AWS::Region}' \
               --name '/${EnvironmentName}/database/ready' \
@@ -857,19 +908,24 @@ Resources:
 
           docker stack deploy --compose-file /opt/codetracker/stack.yml codetracker
 
-          for attempt in $(seq 1 120); do
+          for attempt in $(seq 1 90); do
             READY_SERVICES=$(docker service ls --filter label=com.docker.stack.namespace=codetracker \
-              --format '{{.Replicas}}' | grep -Ec '^(2/2|1/1)$' || true)
+              --format '{{.Name}} {{.Replicas}}' | awk '
+                $1 == "codetracker_backend" && $2 == "4/4" { ready++ }
+                $1 == "codetracker_frontend" && $2 == "2/2" { ready++ }
+                $1 == "codetracker_etiquetas" && $2 == "1/1" { ready++ }
+                END { print ready + 0 }
+              ')
 
             if [ "$READY_SERVICES" = 3 ]; then
-              if docker run --rm --network codetracker_application curlimages/curl:8.12.1 \
-                --fail --silent --show-error --max-time 15 http://frontend/ > /dev/null; then
-                BACKEND_STATUS=$(docker run --rm --network codetracker_application curlimages/curl:8.12.1 \
+              if curl --fail --silent --show-error --max-time 15 \
+                'http://${ApplicationLoadBalancer.DNSName}/' > /dev/null; then
+                BACKEND_STATUS=$(curl \
                   --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
-                  http://frontend/api/ || true)
-                ETIQUETAS_STATUS=$(docker run --rm --network codetracker_application curlimages/curl:8.12.1 \
+                  'http://${ApplicationLoadBalancer.DNSName}/api/' || true)
+                ETIQUETAS_STATUS=$(curl \
                   --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
-                  http://frontend/etiquetas-api/ || true)
+                  'http://${ApplicationLoadBalancer.DNSName}/etiquetas-api/' || true)
 
                 if [[ "$BACKEND_STATUS" =~ ^[234][0-9][0-9]$ ]] && \
                    [[ "$ETIQUETAS_STATUS" =~ ^[234][0-9][0-9]$ ]]; then
@@ -1095,6 +1151,7 @@ Resources:
     Properties:
       ImageId: !Ref UbuntuAmiId
       InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
         - AssociatePublicIpAddress: false
@@ -1213,17 +1270,21 @@ Resources:
           mountpoint -q /var/lib/mysql || mount /var/lib/mysql
           rmdir /var/lib/mysql/lost+found 2>/dev/null || true
 
-          install_packages mysql-server git ca-certificates curl unzip
+          install_packages mysql-server git apache2-utils ca-certificates curl unzip
           install_aws_cli
           systemctl enable --now mysql
 
-          cat > /etc/mysql/mysql.conf.d/99-lamar-network.cnf <<'MYSQL_CONFIG'
+          cat > /etc/mysql/mysql.conf.d/zz-lamar-network.cnf <<'MYSQL_CONFIG'
           [mysqld]
           bind-address = 0.0.0.0
           mysqlx-bind-address = 127.0.0.1
           MYSQL_CONFIG
 
           systemctl restart mysql
+          if [ "$(mysql --batch --skip-column-names --execute 'SELECT @@global.bind_address;')" != '0.0.0.0' ]; then
+            echo "MySQL nao esta escutando na rede privada." >&2
+            exit 1
+          fi
 
           if [ ! -f /var/lib/mysql/.lamar-import-complete ]; then
             TABLE_COUNT=$(mysql --batch --skip-column-names --execute \
@@ -1233,9 +1294,30 @@ Resources:
               exit 1
             fi
 
-            git clone --depth 1 https://github.com/EnzoServilha/Banco_Grupo7.git /opt/Banco_Grupo7
+            BOOTSTRAP_STAGE=database-import
+            CLONE_COMPLETE=false
+            for attempt in $(seq 1 3); do
+              CLONE_DIR=$(mktemp -d /opt/banco-clone.XXXXXX)
+              if timeout --signal=TERM --kill-after=5s 120 \
+                git clone --depth 1 https://github.com/EnzoServilha/Banco_Grupo7.git "$CLONE_DIR/repo"; then
+                mv "$CLONE_DIR/repo" /opt/Banco_Grupo7
+                rmdir "$CLONE_DIR"
+                CLONE_COMPLETE=true
+                break
+              fi
+              echo "Falha ao clonar o SQL (tentativa $attempt de 3)." >&2
+              rm -rf -- "$CLONE_DIR"
+              if [ "$attempt" -lt 3 ]; then
+                sleep 10
+              fi
+            done
+            if [ "$CLONE_COMPLETE" != true ]; then
+              echo "Nao foi possivel baixar o SQL do GitHub." >&2
+              exit 1
+            fi
             mysql --default-character-set=utf8mb4 < /opt/Banco_Grupo7/SCRIPT-Lamar-AutoPecas.sql
             git -C /opt/Banco_Grupo7 rev-parse HEAD > /var/lib/mysql/.lamar-import-complete
+            BOOTSTRAP_STAGE=configuration
           fi
 
           mysql <<'SQL'
@@ -1245,6 +1327,28 @@ Resources:
           GRANT ALL PRIVILEGES ON `${DatabaseName}`.* TO '${DatabaseUser}'@'10.0.0.%';
           FLUSH PRIVILEGES;
           SQL
+
+          BOOTSTRAP_STAGE=admin-account
+          ADMIN_RECORD=$(printf '%s\n' '${AdminPassword}' | htpasswd -niB -C 10 admin)
+          ADMIN_HASH=$(printf '%s' "$ADMIN_RECORD" | cut -d: -f2-)
+          if [ "$ADMIN_HASH" = "$ADMIN_RECORD" ] || [ -z "$ADMIN_HASH" ]; then
+            echo "Nao foi possivel gerar o hash BCrypt do administrador." >&2
+            exit 1
+          fi
+          unset ADMIN_RECORD
+          UPDATED_ADMIN=$(mysql --database='${DatabaseName}' --batch --skip-column-names <<SQL
+          UPDATE usuario SET senha = '$ADMIN_HASH'
+          WHERE email = 'admin@teste.com' AND ativo = 1
+            AND permissao_id = (SELECT id FROM permissao WHERE nome = 'ROLE_ADMIN');
+          SELECT ROW_COUNT();
+          SQL
+          )
+          unset ADMIN_HASH
+          if [ "$UPDATED_ADMIN" != 1 ]; then
+            echo "Administrador ativo admin@teste.com com ROLE_ADMIN nao encontrado no banco importado." >&2
+            exit 1
+          fi
+          BOOTSTRAP_STAGE=configuration
 
           aws ssm put-parameter \
             --region '${AWS::Region}' \
@@ -1434,6 +1538,11 @@ Resources:
 
   ApplicationLoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - InternetGatewayAttachment
+      - PublicDefaultRoute
+      - PublicSubnetAz1RouteTableAssociation
+      - PublicSubnetAz2RouteTableAssociation
     Properties:
       Name: !Sub '${EnvironmentName}-alb'
       Scheme: internet-facing

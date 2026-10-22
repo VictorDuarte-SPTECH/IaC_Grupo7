@@ -33,7 +33,6 @@ set -e
 # - Security Groups
 # - EC2
 # - EBS
-# - S3
 # - CloudWatch
 # - SNS
 # - IAM
@@ -82,7 +81,7 @@ echo ""
 # --- 1. VERIFICAR DEPENDÊNCIAS ---
 # --------------------------------------------------
 
-echo "[1/13] Verificando dependências..."
+echo "[1/12] Verificando dependências..."
 
 if ! command -v aws >/dev/null 2>&1; then
     echo "ERRO: AWS CLI não encontrada."
@@ -104,7 +103,7 @@ echo "Dependências OK."
 # --------------------------------------------------
 
 echo ""
-echo "[2/13] Aguardando LocalStack..."
+echo "[2/12] Aguardando LocalStack..."
 
 MAX_ATTEMPTS=15
 ATTEMPT=0
@@ -135,7 +134,7 @@ echo "LocalStack disponível."
 # --------------------------------------------------
 
 echo ""
-echo "[3/13] Criando VPC..."
+echo "[3/12] Criando VPC..."
 
 VPC_ID=$(aws_local ec2 create-vpc \
     --cidr-block "${VPC_CIDR}" \
@@ -165,7 +164,7 @@ echo "DNS da VPC habilitado."
 # --------------------------------------------------
 
 echo ""
-echo "[4/13] Criando Internet Gateway..."
+echo "[4/12] Criando Internet Gateway..."
 
 IGW_ID=$(aws_local ec2 create-internet-gateway \
     --tag-specifications \
@@ -188,7 +187,7 @@ echo "Internet Gateway associado à VPC."
 # --------------------------------------------------
 
 echo ""
-echo "[5/13] Criando subnets..."
+echo "[5/12] Criando subnets..."
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -280,7 +279,7 @@ echo "  Backend B:  ${BACKEND_B_ID}  10.0.0.112/28"
 # --------------------------------------------------
 
 echo ""
-echo "[6/13] Criando Route Tables..."
+echo "[6/12] Criando Route Tables..."
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -396,7 +395,7 @@ echo "Route Tables criadas."
 # --------------------------------------------------
 
 echo ""
-echo "[7/13] Criando NAT Gateways..."
+echo "[7/12] Criando NAT Gateways..."
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -500,7 +499,7 @@ fi
 # --------------------------------------------------
 
 echo ""
-echo "[8/13] Criando Security Groups..."
+echo "[8/12] Criando Security Groups..."
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -599,7 +598,7 @@ echo "Security Groups criados."
 # --------------------------------------------------
 
 echo ""
-echo "[9/13] Criando instâncias EC2..."
+echo "[9/12] Criando instâncias EC2..."
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -717,7 +716,7 @@ echo "  Database B: ${DATABASE_B_INSTANCE}"
 # --------------------------------------------------
 
 echo ""
-echo "[10/13] Criando volume EBS para zona B..."
+echo "[10/12] Criando volume EBS para zona B..."
 
 
 # EBS_A_ID=$(aws_local ec2 create-volume \
@@ -764,25 +763,11 @@ aws_local ec2 attach-volume \
 
 
 # --------------------------------------------------
-# --- 11. S3 DATALAKE ---
+# --- 11. SNS ---
 # --------------------------------------------------
 
 echo ""
-echo "[11/13] Criando buckets S3 para datalake..."
-
-for bucket in bronze silver gold; do
-  aws_local s3 mb s3://$bucket || true
-done
-
-echo "Buckets bronze, silver e gold criados."
-
-
-# --------------------------------------------------
-# --- 12. SNS ---
-# --------------------------------------------------
-
-echo ""
-echo "[12/13] Criando tópicos SNS para notificações..."
+echo "[11/12] Criando tópicos SNS para notificações..."
 
 SNS_TOPIC_ARN=$(aws_local sns create-topic \
     --name estoque-autopecas-alertas \
@@ -805,7 +790,7 @@ aws_local sns subscribe \
 # --------------------------------------------------
 
 echo ""
-echo "[13/13] Criando métricas e alarmes no CloudWatch para o EBS..."
+echo "[12/12] Criando métricas e alarmes no CloudWatch para o EBS..."
 
 # Simula que o volume está 70% cheio
 aws_local cloudwatch put-metric-data \

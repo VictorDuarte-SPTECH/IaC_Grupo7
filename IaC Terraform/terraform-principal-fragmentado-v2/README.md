@@ -6,7 +6,6 @@ Esta pasta contém a mesma stack principal organizada por responsabilidade:
 - `variables.tf`: variáveis de entrada;
 - `network.tf`: VPC, sub-redes, gateways, rotas e Security Groups;
 - `instances.tf`: EC2, Docker Swarm, RabbitMQ, EBS, MySQL, Application Load Balancer e scripts `user_data`;
-- `storage.tf.disabled`: buckets antigos do Data Lake, preservados e ignorados;
 - `outputs.tf`: valores exibidos após o provisionamento.
 
 Todos os arquivos `.tf` desta pasta formam uma única configuração e uma única
@@ -74,13 +73,11 @@ em `key_name` um par de chaves EC2 existente na região.
 1. Confirme o `instance_profile_name` antes do `plan`.
 2. Defina `key_name`, `rabbitmq_password` e `database_password` no
    `terraform.tfvars`.
-3. O Data Lake está desativado nesta stack; não renomeie `storage.tf.disabled`
-   para `.tf`.
-4. A aplicação web não é iniciada por esta stack. Portanto, os targets do ALB ficarão
+3. A aplicação web não é iniciada por esta stack. Portanto, os targets do ALB ficarão
    sem aplicações saudáveis até a etapa dos containers.
-5. Dois NAT Gateways e um Application Load Balancer consomem orçamento enquanto
+4. Dois NAT Gateways e um Application Load Balancer consomem orçamento enquanto
    permanecerem provisionados.
-6. As senhas são marcadas como sensíveis na interface do Terraform, mas ficam
+5. As senhas são marcadas como sensíveis na interface do Terraform, mas ficam
    armazenadas no state. Proteja o arquivo ou backend de estado.
 
 ## Comandos iniciais
