@@ -1,0 +1,940 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ingestao bruta no Bronze, job Glue para normalizar Ipeadata e Comex Stat no Silver e bucket Gold reservado para uso futuro.
+
+Parameters:
+  LambdaRoleName:
+    Type: String
+    Default: LabRole
+    Description: Role existente para Lambda, escrita no Bronze/artefatos, logs e inicio do workflow.
+  GlueRoleName:
+    Type: String
+    Default: LabRole
+    Description: Role existente com trust para glue.amazonaws.com e acesso S3, logs e Glue Catalog.
+  WorkflowRoleName:
+    Type: String
+    Default: LabRole
+    Description: Role existente com trust para states.amazonaws.com e permissoes Lambda e Glue sync.
+  InitialLoadRevision:
+    Type: String
+    Default: '1'
+    Description: Altere para repetir a carga inicial em uma atualizacao da stack.
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, ENABLED]
+    Description: Habilite somente depois de validar as coletas manuais e o orcamento.
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 12 10 * ? *)'
+    Description: Agendamento EventBridge em UTC; padrao dia 10 de cada mes as 12h.
+  ComexYears:
+    Type: Number
+    Default: 25
+    MinValue: 1
+    MaxValue: 30
+    Description: Janela de anos-calendario incluindo o ultimo ano disponivel.
+  ComexNcmCodes:
+    Type: CommaDelimitedList
+    Default: '84271011,84272010,84271019,84279000,84312011,84312019'
+    AllowedPattern: '[0-9]{8}'
+    Description: NCMs extraidos da consulta salva 162584; o fluxo permanece importacao.
+
+Mappings:
+  GlueScript:
+    Silver:
+      Code: |
+        import argparse
+        from datetime import date, datetime, timezone
+        from decimal import Decimal, InvalidOperation, localcontext
+        import hashlib
+        import io
+        import json
+        import logging
+        import re
+        import uuid
+
+        import boto3
+
+
+        LOGGER = logging.getLogger(__name__)
+        SOURCES = ("ipeadata", "comexstat")
+        MAX_BYTES = 32 * 1024 * 1024
+        SCHEMAS = {
+            "ipeadata": [
+                ("serie_codigo", "string"), ("data_referencia", "date"), ("ano", "int"),
+                ("taxa_cambio", "decimal(38,30)"), ("nivel", "string"), ("territorio_codigo", "string"),
+            ],
+            "comexstat": [
+                ("fluxo", "string"), ("data_referencia", "date"), ("ano", "int"), ("mes", "int"),
+                ("ncm_codigo", "string"), ("ncm_descricao", "string"), ("pais", "string"),
+                ("uf_produto", "string"), ("valor_fob_usd", "decimal(38,6)"),
+                ("quilograma_liquido", "decimal(38,6)"), ("quantidade_estatistica", "decimal(38,6)"),
+            ],
+        }
+        LINEAGE = [("bronze_key", "string"), ("bronze_run_id", "string"), ("data_ingestao", "date")]
+
+
+        def text(value, name, optional=False):
+            if optional and value in (None, ""):
+                return None
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(name + " deve ser texto nao vazio")
+            return value.strip()
+
+
+        def decimal_value(value, name, scale, optional=False):
+            if optional and value is None:
+                return None
+            if isinstance(value, bool) or value is None:
+                raise ValueError(name + " ausente ou invalido")
+            try:
+                number = Decimal(str(value))
+                with localcontext() as context:
+                    context.prec = 80
+                    quantized = number.quantize(Decimal(1).scaleb(-scale))
+                if not number.is_finite() or number < 0 or number != quantized:
+                    raise ValueError(name + " negativo, nao finito ou com precisao excedida")
+                if number >= Decimal(10) ** (38 - scale):
+                    raise ValueError(name + " excede decimal(38,%s)" % scale)
+                return quantized
+            except (InvalidOperation, ValueError) as error:
+                raise ValueError(name + ": numero invalido ou fora da precisao permitida") from error
+
+
+        def normalize(source, record):
+            if not isinstance(record, dict):
+                raise ValueError("registro deve ser um objeto JSON")
+            if source == "ipeadata":
+                series = text(record.get("SERCODIGO"), "SERCODIGO")
+                if series != "BM_ERV":
+                    raise ValueError("serie diferente de BM_ERV")
+                raw_date = text(record.get("VALDATA"), "VALDATA")
+                try:
+                    reference = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).date()
+                except ValueError as error:
+                    raise ValueError("VALDATA invalida") from error
+                if "VALVALOR" not in record:
+                    raise ValueError("VALVALOR ausente; null explicito e permitido")
+                return {
+                    "serie_codigo": series, "data_referencia": reference, "ano": reference.year,
+                    "taxa_cambio": decimal_value(record.get("VALVALOR"), "VALVALOR", 30, optional=True),
+                    "nivel": text(record.get("NIVNOME"), "NIVNOME", optional=True),
+                    "territorio_codigo": text(record.get("TERCODIGO"), "TERCODIGO", optional=True),
+                }
+            if source != "comexstat":
+                raise ValueError("fonte desconhecida")
+            year, month = str(record.get("year")), str(record.get("monthNumber"))
+            if not re.fullmatch(r"[0-9]{4}", year) or not re.fullmatch(r"[0-9]{1,2}", month):
+                raise ValueError("year/monthNumber invalidos")
+            try:
+                reference = date(int(year), int(month), 1)
+            except ValueError as error:
+                raise ValueError("ano/mes invalidos") from error
+            if reference.year < 1997:
+                raise ValueError("ano anterior a base Comex Stat")
+            code = text(record.get("coNcm"), "coNcm")
+            if not re.fullmatch(r"[0-9]{8}", code):
+                raise ValueError("coNcm deve preservar oito digitos como texto")
+            return {
+                "fluxo": "import", "data_referencia": reference, "ano": reference.year,
+                "mes": reference.month, "ncm_codigo": code,
+                "ncm_descricao": text(record.get("ncm"), "ncm"),
+                "pais": text(record.get("country"), "country"),
+                "uf_produto": text(record.get("state"), "state"),
+                "valor_fob_usd": decimal_value(record.get("metricFOB"), "metricFOB", 6),
+                "quilograma_liquido": decimal_value(record.get("metricKG"), "metricKG", 6),
+                "quantidade_estatistica": decimal_value(record.get("metricStatistic"), "metricStatistic", 6),
+            }
+
+
+        def business_key(source, row):
+            if source == "ipeadata":
+                columns = ("serie_codigo", "data_referencia", "nivel", "territorio_codigo")
+            else:
+                columns = ("fluxo", "data_referencia", "ncm_codigo", "pais", "uf_produto")
+            return tuple(row[column] for column in columns)
+
+
+        def normalize_records(source, records):
+            accepted, conflicting, rejected = {}, set(), []
+            duplicates = 0
+            for record, bronze_key in records:
+                try:
+                    row = normalize(source, record)
+                except ValueError as error:
+                    rejected.append({"bronze_key": bronze_key, "reason": str(error), "record": record})
+                    continue
+                key = business_key(source, row)
+                if key in conflicting:
+                    rejected.append({"bronze_key": bronze_key, "reason": "chave de negocio conflitante", "record": record})
+                elif key not in accepted:
+                    accepted[key] = (row, record, bronze_key)
+                elif accepted[key][0] == row:
+                    duplicates += 1
+                else:
+                    previous = accepted.pop(key)
+                    conflicting.add(key)
+                    rejected.extend([
+                        {"bronze_key": previous[2], "reason": "chave de negocio conflitante", "record": previous[1]},
+                        {"bronze_key": bronze_key, "reason": "chave de negocio conflitante", "record": record},
+                    ])
+            return [(entry[0], entry[2]) for entry in accepted.values()], rejected, duplicates
+
+
+        def get_bytes(s3, bucket, key):
+            response = s3.get_object(Bucket=bucket, Key=key)
+            with response["Body"] as stream:
+                raw = stream.read(MAX_BYTES + 1)
+            if len(raw) > MAX_BYTES:
+                raise ValueError("Objeto excede 32 MiB: " + key)
+            return raw
+
+
+        def load_json(s3, bucket, key):
+            return json.loads(get_bytes(s3, bucket, key), parse_float=Decimal)
+
+
+        def latest_manifest(s3, bucket, source, requested_key=None):
+            candidates = []
+            pattern = re.compile(
+                r"^_metadata/" + source
+                + r"/ingestion_date=([0-9]{4}-[0-9]{2}-[0-9]{2})/run_id=([A-Za-z0-9-]+)/manifest\.json$"
+            )
+            if requested_key:
+                if not pattern.fullmatch(requested_key):
+                    raise ValueError("Manifesto solicitado fora do prefixo permitido para " + source)
+                key = requested_key
+            else:
+                for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix="_metadata/" + source + "/"):
+                    for item in page.get("Contents", []):
+                        if pattern.fullmatch(item["Key"]):
+                            candidates.append(item)
+                if not candidates:
+                    raise ValueError("Nenhum manifesto completo encontrado para " + source)
+                key = max(candidates, key=lambda item: (item["LastModified"], item["Key"]))["Key"]
+            match = pattern.fullmatch(key)
+            manifest = load_json(s3, bucket, key)
+            if manifest.get("status") != "COMPLETE" or manifest.get("source") != source:
+                raise ValueError("Manifesto nao confirma conclusao da fonte: " + key)
+            keys = manifest.get("keys")
+            if (not isinstance(keys, list) or not keys
+                    or any(not isinstance(item, str) for item in keys) or len(keys) != len(set(keys))):
+                raise ValueError("Lista de objetos invalida no manifesto: " + key)
+            ingestion_date, run_id = match.groups()
+            prefix = ("ipeadata/serie=BM_ERV/" if source == "ipeadata" else "comexstat/consulta=162584/flow=import/")
+            prefix += "ingestion_date=" + ingestion_date + "/run_id=" + run_id + "/"
+            if any(not isinstance(item, str) or not item.startswith(prefix) or not item.endswith(".json") for item in keys):
+                raise ValueError("Manifesto aponta para objetos fora do snapshot permitido")
+            return key, keys, date.fromisoformat(ingestion_date), run_id
+
+
+        def read_records(s3, bucket, source, keys):
+            for key in keys:
+                raw = get_bytes(s3, bucket, key)
+                metadata = load_json(s3, bucket, "_metadata/" + key)
+                if (metadata.get("key") != key or metadata.get("bytes") != len(raw)
+                        or metadata.get("sha256") != hashlib.sha256(raw).hexdigest()):
+                    raise ValueError("Integridade do objeto Bronze nao confirmada: " + key)
+                document = json.loads(raw, parse_float=Decimal)
+                if source == "ipeadata":
+                    records = document.get("value")
+                else:
+                    if document.get("success") is not True or not isinstance(document.get("data"), dict):
+                        raise ValueError("Envelope Comex invalido: " + key)
+                    records = document["data"].get("list")
+                if not isinstance(records, list) or not records:
+                    raise ValueError("Envelope sem registros: " + key)
+                for record in records:
+                    yield record, key
+
+
+        def arrow_schema(source):
+            import pyarrow as pa
+
+            primitive = {"string": pa.string(), "int": pa.int32(), "date": pa.date32()}
+            fields = []
+            for name, kind in SCHEMAS[source] + LINEAGE:
+                if kind.startswith("decimal"):
+                    precision, scale = map(int, re.findall(r"\d+", kind))
+                    arrow_type = pa.decimal128(precision, scale)
+                else:
+                    arrow_type = primitive[kind]
+                fields.append(pa.field(name, arrow_type))
+            return pa.schema(fields)
+
+
+        def parquet_bytes(source, rows):
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            output = io.BytesIO()
+            table = pa.Table.from_pylist(rows, schema=arrow_schema(source))
+            pq.write_table(table, output, compression="snappy")
+            return output.getvalue()
+
+
+        def put_json(s3, bucket, key, document):
+            s3.put_object(
+                Bucket=bucket, Key=key, Body=json.dumps(document, default=str).encode("utf-8"),
+                ContentType="application/json",
+            )
+
+
+        def publish_table(glue, database, source, location, manifest_key):
+            table = {
+                "Name": source, "TableType": "EXTERNAL_TABLE",
+                "Parameters": {"classification": "parquet", "EXTERNAL": "TRUE", "bronze_manifest": manifest_key},
+                "StorageDescriptor": {
+                    "Columns": [{"Name": name, "Type": kind} for name, kind in SCHEMAS[source] + LINEAGE],
+                    "Location": location,
+                    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    "SerdeInfo": {"SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"},
+                },
+            }
+            try:
+                glue.get_table(DatabaseName=database, Name=source)
+            except glue.exceptions.EntityNotFoundException:
+                glue.create_table(DatabaseName=database, TableInput=table)
+            else:
+                glue.update_table(DatabaseName=database, TableInput=table, SkipArchive=True)
+
+
+        def process_source(s3, glue, bronze, silver, database, source, requested_manifest=None):
+            manifest_key, keys, ingestion_date, run_id = latest_manifest(s3, bronze, source, requested_manifest)
+            accepted, rejected, duplicates = normalize_records(source, read_records(s3, bronze, source, keys))
+            processing_id = uuid.uuid4().hex
+            report_key = "_metadata/" + source + "/processing_id=" + processing_id + "/report.json"
+            if rejected:
+                rejection_key = "_rejected/" + source + "/processing_id=" + processing_id + "/records.jsonl"
+                s3.put_object(
+                    Bucket=silver, Key=rejection_key,
+                    Body=("\n".join(json.dumps(item, default=str) for item in rejected) + "\n").encode("utf-8"),
+                    ContentType="application/x-ndjson",
+                )
+                LOGGER.warning("%s: %s registros rejeitados em s3://%s/%s", source, len(rejected), silver, rejection_key)
+            report = {
+                "source": source, "bronze_manifest": manifest_key, "bronze_run_id": run_id,
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "accepted": len(accepted), "rejected": len(rejected), "duplicates_removed": duplicates,
+            }
+            if not accepted:
+                put_json(s3, silver, report_key, dict(report, status="FAILED_NO_VALID_ROWS"))
+                raise ValueError("Nenhum registro valido; tabela anterior preservada para " + source)
+            rows = [
+                dict(row, bronze_key=key, bronze_run_id=run_id, data_ingestao=ingestion_date)
+                for row, key in accepted
+            ]
+            data_prefix = "datasets/" + source + "/snapshots/" + processing_id + "/"
+            s3.put_object(
+                Bucket=silver, Key=data_prefix + "data.parquet",
+                Body=parquet_bytes(source, rows), ContentType="application/vnd.apache.parquet",
+            )
+            location = "s3://" + silver + "/" + data_prefix
+            put_json(s3, silver, report_key, dict(report, status="READY_TO_PUBLISH", location=location))
+            publish_table(glue, database, source, location, manifest_key)
+            put_json(s3, silver, report_key, dict(report, status="PUBLISHED", location=location))
+            LOGGER.info("Silver publicado: %s.%s em %s; contagens=%s", database, source, location, report)
+
+
+        def main():
+            parser = argparse.ArgumentParser()
+            for name in ("BRONZE_BUCKET", "SILVER_BUCKET", "CATALOG_DATABASE"):
+                parser.add_argument("--" + name, required=True)
+            parser.add_argument("--SOURCE", choices=("all",) + SOURCES, default="all")
+            parser.add_argument("--IPEADATA_MANIFEST")
+            parser.add_argument("--COMEXSTAT_MANIFEST")
+            args, _ = parser.parse_known_args()
+            logging.basicConfig(level=logging.INFO)
+            if args.BRONZE_BUCKET == args.SILVER_BUCKET:
+                raise ValueError("Bronze e Silver precisam ser buckets diferentes")
+            s3, glue = boto3.client("s3"), boto3.client("glue")
+            failures = []
+            for source in SOURCES if args.SOURCE == "all" else (args.SOURCE,):
+                try:
+                    requested = args.IPEADATA_MANIFEST if source == "ipeadata" else args.COMEXSTAT_MANIFEST
+                    process_source(s3, glue, args.BRONZE_BUCKET, args.SILVER_BUCKET, args.CATALOG_DATABASE, source, requested)
+                except Exception:
+                    LOGGER.exception("Falha no processamento Silver da fonte %s", source)
+                    failures.append(source)
+            if failures:
+                raise RuntimeError("Falha nas fontes: " + ", ".join(failures))
+
+
+        if __name__ == "__main__":
+            main()
+
+Resources:
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bronze'
+
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-silver'
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-gold'
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-artifacts'
+
+  PublishGlueScript:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt DataBootstrapFunction.Arn
+      ServiceTimeout: 120
+      Action: publish_script
+      Bucket: !Ref ArtifactsBucket
+      ScriptSource: !FindInMap [GlueScript, Silver, Code]
+
+  SilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Tabelas Silver de Ipeadata e Comex Stat publicadas pelo job Glue.
+
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${AWS::StackName}-bronze-to-silver'
+      Description: Processa os ultimos manifestos completos de cada fonte, com rejeitados e publicacao no catalogo.
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${GlueRoleName}'
+      Command:
+        Name: pythonshell
+        PythonVersion: '3.9'
+        ScriptLocation: !GetAtt PublishGlueScript.ScriptS3Uri
+      MaxCapacity: 0.0625
+      Timeout: 15
+      MaxRetries: 0
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      DefaultArguments:
+        '--library-set': none
+        '--additional-python-modules': 'numpy==1.26.4,pyarrow==14.0.2,boto3==1.34.162'
+        '--BRONZE_BUCKET': !Ref BronzeBucket
+        '--SILVER_BUCKET': !Ref SilverBucket
+        '--CATALOG_DATABASE': !Ref SilverDatabase
+        '--SOURCE': all
+
+  IngestionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-bronze-ingestion'
+      RetentionInDays: 14
+
+  BronzeIngestionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: IngestionLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bronze-ingestion'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaRoleName}'
+      MemorySize: 512
+      Timeout: 300
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BronzeBucket
+          COMEX_YEARS: !Ref ComexYears
+          COMEX_NCM_CODES: !Join [',', !Ref ComexNcmCodes]
+      Code:
+        ZipFile: |
+          import hashlib
+          import json
+          import logging
+          import os
+          import socket
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          s3 = boto3.client("s3")
+          BUCKET = os.environ["BUCKET_NAME"]
+          COMEX_URL = "https://api-comexstat.mdic.gov.br"
+          IPEA_URL = "https://www.ipeadata.gov.br/api/odata4/Metadados('BM_ERV')/Valores"
+          MAX_BYTES = 32 * 1024 * 1024
+
+          def fetch_json(url, context, payload=None):
+              body = None if payload is None else json.dumps(payload).encode("utf-8")
+              for attempt in range(3):
+                  remaining = context.get_remaining_time_in_millis() / 1000
+                  if remaining < 20:
+                      raise TimeoutError("Tempo insuficiente para concluir a coleta e gravar no S3.")
+                  request = urllib.request.Request(
+                      url, data=body,
+                      headers={"Accept": "application/json",
+                               "Content-Type": "application/json",
+                               "User-Agent": "CodeTracker-Bronze/1.0"},
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=min(90, remaining - 15)) as response:
+                          raw = response.read(MAX_BYTES + 1)
+                      if len(raw) > MAX_BYTES:
+                          raise ValueError("Resposta excede 32 MiB; divida a consulta antes de repetir.")
+                      data = json.loads(raw)
+                      if not isinstance(data, dict):
+                          raise ValueError("A fonte retornou JSON em formato inesperado.")
+                      return raw, data
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                          raise
+                      retry_after = error.headers.get("Retry-After", "")
+                      delay = int(retry_after) if retry_after.isdigit() else 10 * (2 ** attempt)
+                      if delay > 60:
+                          raise RuntimeError("Fonte solicitou espera longa; tente em outra execucao.") from error
+                      logger.warning("HTTP %s em %s; nova tentativa em %ss", error.code, url, delay)
+                  except (urllib.error.URLError, TimeoutError, socket.timeout):
+                      if attempt == 2:
+                          raise
+                      delay = 10 * (2 ** attempt)
+                      logger.warning("Falha de rede em %s; nova tentativa em %ss", url, delay)
+                  if context.get_remaining_time_in_millis() / 1000 < delay + 25:
+                      raise TimeoutError("Sem tempo para repetir a requisicao com seguranca.")
+                  time.sleep(delay)
+              raise RuntimeError("Coleta nao concluida.")
+
+          def save_response(key, raw, source_url, request_payload=None):
+              digest = hashlib.sha256(raw).hexdigest()
+              s3.put_object(
+                  Bucket=BUCKET, Key=key, Body=raw,
+                  ContentType="application/json",
+                  Metadata={"sha256": digest},
+              )
+              metadata_key = "_metadata/" + key
+              metadata = {
+                  "source_url": source_url, "request": request_payload,
+                  "collected_at": datetime.now(timezone.utc).isoformat(),
+                  "key": key, "bytes": len(raw), "sha256": digest,
+              }
+              s3.put_object(
+                  Bucket=BUCKET, Key=metadata_key,
+                  Body=json.dumps(metadata).encode("utf-8"),
+                  ContentType="application/json",
+              )
+              logger.info("Objeto bruto salvo: s3://%s/%s (%s bytes)", BUCKET, key, len(raw))
+              return key
+
+          def collect_ipeadata(context, partition):
+              url = IPEA_URL
+              visited = set()
+              keys = []
+              while url:
+                  parsed = urllib.parse.urlsplit(url)
+                  if (parsed.scheme != "https" or parsed.netloc != "www.ipeadata.gov.br"
+                          or not parsed.path.startswith("/api/odata4/")):
+                      raise ValueError("Endereco de paginacao Ipeadata nao permitido.")
+                  if url in visited or len(visited) >= 100:
+                      raise ValueError("Paginacao Ipeadata repetida ou acima de 100 paginas.")
+                  visited.add(url)
+                  raw, data = fetch_json(url, context)
+                  if not isinstance(data.get("value"), list) or not data["value"]:
+                      raise ValueError("Ipeadata sem valores ou com resposta invalida.")
+                  key = "ipeadata/serie=BM_ERV/" + partition + "/page-%04d.json" % len(visited)
+                  keys.append(save_response(key, raw, url))
+                  next_url = data.get("@odata.nextLink")
+                  if next_url is not None and not isinstance(next_url, str):
+                      raise ValueError("Paginacao Ipeadata invalida.")
+                  url = urllib.parse.urljoin(url, next_url) if next_url else None
+              return keys
+
+          def collect_comexstat(context, partition):
+              _, availability = fetch_json(COMEX_URL + "/general/dates/updated", context)
+              if availability.get("success") is not True:
+                  raise ValueError("Comex Stat nao confirmou a disponibilidade dos dados.")
+              dates = availability["data"]
+              year, month = int(dates["year"]), int(dates["monthNumber"])
+              if not 1997 <= year <= datetime.now(timezone.utc).year or not 1 <= month <= 12:
+                  raise ValueError("Ultimo periodo disponivel do Comex Stat invalido.")
+              years = int(os.environ["COMEX_YEARS"])
+              if not 1 <= years <= 30:
+                  raise ValueError("COMEX_YEARS deve estar entre 1 e 30.")
+              codes = os.environ["COMEX_NCM_CODES"].split(",")
+              if not codes or any(len(code) != 8 or not code.isascii() or not code.isdigit() for code in codes):
+                  raise ValueError("COMEX_NCM_CODES deve conter codigos NCM de oito digitos.")
+              payload = {
+                  "flow": "import", "monthDetail": True,
+                  "period": {"from": "%04d-01" % max(1997, year - years + 1),
+                             "to": "%04d-%02d" % (year, month)},
+                  "filters": [{"filter": "ncm", "values": codes}],
+                  "details": ["ncm", "country", "state"],
+                  "metrics": ["metricFOB", "metricKG", "metricStatistic"],
+              }
+              url = COMEX_URL + "/general?language=pt"
+              raw, data = fetch_json(url, context, payload)
+              if data.get("success") is not True or not isinstance(data.get("data"), dict):
+                  raise ValueError("Comex Stat retornou falha na consulta.")
+              if not isinstance(data["data"].get("list"), list) or not data["data"]["list"]:
+                  raise ValueError("Comex Stat retornou consulta vazia ou estrutura inesperada.")
+              key = "comexstat/consulta=162584/flow=import/" + partition + "/response.json"
+              return [save_response(key, raw, url, payload)]
+
+          def lambda_handler(event, context):
+              source = event.get("source")
+              collectors = {"ipeadata": collect_ipeadata, "comexstat": collect_comexstat}
+              if source not in collectors:
+                  raise ValueError("Informe source=ipeadata ou source=comexstat.")
+              now = datetime.now(timezone.utc)
+              partition = "ingestion_date=" + now.strftime("%Y-%m-%d") + "/run_id=" + context.aws_request_id
+              try:
+                  keys = collectors[source](context, partition)
+                  manifest_key = "_metadata/" + source + "/" + partition + "/manifest.json"
+                  manifest = {"status": "COMPLETE", "source": source, "keys": keys}
+                  s3.put_object(
+                      Bucket=BUCKET, Key=manifest_key,
+                      Body=json.dumps(manifest).encode("utf-8"),
+                      ContentType="application/json",
+                  )
+                  logger.info("Coleta completa: %s, manifest=%s", source, manifest_key)
+                  return {"source": source, "bucket": BUCKET, "keys": keys, "manifest": manifest_key}
+              except Exception:
+                  logger.exception("Falha na coleta da fonte %s; execucao %s", source, context.aws_request_id)
+                  raise
+
+  IngestionRetryPolicy:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref BronzeIngestionFunction
+      Qualifier: '$LATEST'
+      MaximumRetryAttempts: 1
+      MaximumEventAgeInSeconds: 3600
+
+  IngestionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Coletas independentes das duas fontes; desativado por padrao.
+      ScheduleExpression: !Ref ScheduleExpression
+      State: !Ref ScheduleState
+      Targets:
+        - Id: Ipeadata
+          Arn: !GetAtt BronzeIngestionFunction.Arn
+          Input: '{"source":"ipeadata"}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 1
+        - Id: ComexStat
+          Arn: !GetAtt BronzeIngestionFunction.Arn
+          Input: '{"source":"comexstat"}'
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 3600
+            MaximumRetryAttempts: 1
+
+  IngestionSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BronzeIngestionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IngestionSchedule.Arn
+
+  BootstrapLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-data-bootstrap'
+      RetentionInDays: 14
+
+  DataBootstrapFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: BootstrapLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-data-bootstrap'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${LambdaRoleName}'
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import hashlib
+          import json
+          import logging
+          import urllib.error
+          import urllib.request
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          workflows = boto3.client("stepfunctions")
+          s3 = boto3.client("s3")
+
+          def respond(request, status, data, reason):
+              body = {
+                  "Status": status, "Reason": reason[:500],
+                  "PhysicalResourceId": request.get("PhysicalResourceId")
+                      or request["StackId"] + "/" + request["LogicalResourceId"],
+                  "StackId": request["StackId"], "RequestId": request["RequestId"],
+                  "LogicalResourceId": request["LogicalResourceId"], "Data": data,
+              }
+              encoded = json.dumps(body).encode("utf-8")
+              callback = urllib.request.Request(
+                  request["ResponseURL"], data=encoded, method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(encoded))},
+              )
+              try:
+                  with urllib.request.urlopen(callback, timeout=15):
+                      pass
+              except (urllib.error.URLError, TimeoutError):
+                  raise RuntimeError("Falha ao enviar resposta ao CloudFormation.") from None
+              logger.info("Resposta %s enviada para %s", status, request["LogicalResourceId"])
+
+          def lambda_handler(event, context):
+              if event.get("mode") == "callback":
+                  if event.get("status") not in ("SUCCESS", "FAILED"):
+                      raise ValueError("Status de callback invalido.")
+                  data = event.get("data", {})
+                  reason = ("Bronze e Silver carregados." if event["status"] == "SUCCESS"
+                            else "Carga inicial falhou. Consulte Step Functions e logs Lambda/Glue.")
+                  if data.get("WorkflowExecutionArn"):
+                      reason += " Execucao: " + data["WorkflowExecutionArn"]
+                  respond(
+                      event["request"], event["status"], data, reason,
+                  )
+                  return {"status": event["status"]}
+              request_type = event.get("RequestType")
+              if request_type == "Delete":
+                  respond(event, "SUCCESS", {}, "Remocao sem apagar dados retidos.")
+                  return
+              if request_type not in ("Create", "Update"):
+                  raise ValueError("Tipo de solicitacao CloudFormation invalido.")
+              properties = event["ResourceProperties"]
+              if properties.get("Action") == "publish_script":
+                  try:
+                      script = properties["ScriptSource"]
+                      if not isinstance(script, str) or not script.strip():
+                          raise ValueError("Script Glue vazio ou invalido.")
+                      compile(script, "bronze_to_silver.py", "exec")
+                      raw = script.encode("utf-8")
+                      digest = hashlib.sha256(raw).hexdigest()
+                      key = "glue/bronze_to_silver-" + digest + ".py"
+                      s3.put_object(
+                          Bucket=properties["Bucket"], Key=key, Body=raw,
+                          ContentType="text/x-python", Metadata={"sha256": digest},
+                      )
+                  except Exception:
+                      logger.exception("Falha ao publicar o script Glue nos artefatos.")
+                      respond(event, "FAILED", {}, "Falha ao publicar o script Glue; confira S3, IAM e logs.")
+                      raise
+                  uri = "s3://" + properties["Bucket"] + "/" + key
+                  respond(event, "SUCCESS", {"ScriptS3Uri": uri, "ScriptSha256": digest},
+                          "Script Glue publicado automaticamente.")
+                  return {"ScriptS3Uri": uri}
+              request = {
+                  key: event[key]
+                  for key in ("ResponseURL", "StackId", "RequestId", "LogicalResourceId")
+              }
+              if event.get("PhysicalResourceId"):
+                  request["PhysicalResourceId"] = event["PhysicalResourceId"]
+              try:
+                  execution = workflows.start_execution(
+                      stateMachineArn=event["ResourceProperties"]["WorkflowArn"],
+                      name=event["RequestId"],
+                      input=json.dumps({"request": request}),
+                  )
+              except Exception:
+                  logger.exception("Nao foi possivel iniciar a carga inicial.")
+                  respond(event, "FAILED", {}, "Falha ao iniciar Step Functions; confira permissoes e logs.")
+                  raise
+              logger.info("Carga inicial iniciada: %s", execution["executionArn"])
+              return {"executionArn": execution["executionArn"]}
+
+  InitialLoadWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineType: STANDARD
+      RoleArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${WorkflowRoleName}'
+      Definition:
+        Comment: Coleta as duas fontes, aguarda Silver e responde ao CloudFormation.
+        StartAt: CollectIpeadata
+        TimeoutSeconds: 2200
+        States:
+          CollectIpeadata:
+            Type: Task
+            Resource: !GetAtt BronzeIngestionFunction.Arn
+            Parameters:
+              source: ipeadata
+            ResultPath: $.ipeadata
+            TimeoutSeconds: 330
+            Next: CollectComexStat
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: ReportFailure
+          CollectComexStat:
+            Type: Task
+            Resource: !GetAtt BronzeIngestionFunction.Arn
+            Parameters:
+              source: comexstat
+            ResultPath: $.comexstat
+            TimeoutSeconds: 330
+            Next: ProcessSilver
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: ReportFailure
+          ProcessSilver:
+            Type: Task
+            Resource: !Sub 'arn:${AWS::Partition}:states:::glue:startJobRun.sync'
+            Parameters:
+              JobName: !Ref BronzeToSilverJob
+              Arguments:
+                '--SOURCE': all
+                '--IPEADATA_MANIFEST.$': $.ipeadata.manifest
+                '--COMEXSTAT_MANIFEST.$': $.comexstat.manifest
+            ResultPath: $.silver
+            TimeoutSeconds: 960
+            Next: ReportSuccess
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: ReportFailure
+          ReportSuccess:
+            Type: Task
+            Resource: !GetAtt DataBootstrapFunction.Arn
+            Parameters:
+              mode: callback
+              status: SUCCESS
+              request.$: $.request
+              data:
+                IpeadataManifest.$: $.ipeadata.manifest
+                ComexStatManifest.$: $.comexstat.manifest
+                GlueJobRunId.$: $.silver.JobRunId
+                WorkflowExecutionArn.$: $$.Execution.Id
+            ResultPath: $.callback
+            TimeoutSeconds: 70
+            Retry:
+              - ErrorEquals: [States.TaskFailed, States.Timeout]
+                IntervalSeconds: 5
+                BackoffRate: 2
+                MaxAttempts: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.failure
+                Next: ReportFailure
+            End: true
+          ReportFailure:
+            Type: Task
+            Resource: !GetAtt DataBootstrapFunction.Arn
+            Parameters:
+              mode: callback
+              status: FAILED
+              request.$: $.request
+              data:
+                WorkflowExecutionArn.$: $$.Execution.Id
+            ResultPath: $.callback
+            TimeoutSeconds: 70
+            Retry:
+              - ErrorEquals: [States.TaskFailed, States.Timeout]
+                IntervalSeconds: 5
+                BackoffRate: 2
+                MaxAttempts: 2
+            Next: InitialLoadFailed
+          InitialLoadFailed:
+            Type: Fail
+            Error: InitialLoadFailed
+            Cause: Falha na carga inicial; CloudFormation foi notificado.
+
+  InitialDataLoad:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - BronzeIngestionFunction
+      - BronzeToSilverJob
+      - IngestionRetryPolicy
+      - IngestionSchedule
+      - IngestionSchedulePermission
+    Properties:
+      ServiceToken: !GetAtt DataBootstrapFunction.Arn
+      ServiceTimeout: 2400
+      WorkflowArn: !Ref InitialLoadWorkflow
+      Revision: !Ref InitialLoadRevision
+      GlueScriptS3Uri: !GetAtt PublishGlueScript.ScriptS3Uri
+      BronzeBucket: !Ref BronzeBucket
+      SilverBucket: !Ref SilverBucket
+      ComexYears: !Ref ComexYears
+      ComexNcmCodes: !Join [',', !Ref ComexNcmCodes]
+
+Outputs:
+  BronzeBucketName:
+    Description: Bucket Bronze usado pelas coletas.
+    Value: !Ref BronzeBucket
+  IngestionFunctionName:
+    Description: Funcao para invocacao autenticada com source=ipeadata ou source=comexstat.
+    Value: !Ref BronzeIngestionFunction
+  ScheduleRuleName:
+    Description: Regra mensal, desativada por padrao.
+    Value: !Ref IngestionSchedule
+  SilverBucketName:
+    Description: Bucket Silver dos Parquets, rejeitados e relatorios de processamento.
+    Value: !Ref SilverBucket
+  GoldBucketName:
+    Description: Bucket Gold reservado para uso futuro, sem carga ou processamento configurados.
+    Value: !Ref GoldBucket
+  ArtifactsBucketName:
+    Description: Bucket exclusivo da stack onde o script Glue e publicado automaticamente.
+    Value: !Ref ArtifactsBucket
+  GlueScriptS3Uri:
+    Description: URI versionada do script Glue publicado automaticamente.
+    Value: !GetAtt PublishGlueScript.ScriptS3Uri
+  SilverGlueJobName:
+    Description: Job Bronze para Silver; executado na carga inicial e manualmente depois.
+    Value: !Ref BronzeToSilverJob
+  SilverCatalogDatabase:
+    Description: Database do catalogo; tabelas sao publicadas apos o primeiro processamento valido.
+    Value: !Ref SilverDatabase
+  InitialLoadWorkflowArn:
+    Description: Workflow que bloqueia a conclusao da stack ate carregar Bronze e Silver.
+    Value: !Ref InitialLoadWorkflow
+  InitialLoadGlueRunId:
+    Description: Execucao Glue concluida durante a carga inicial.
+    Value: !GetAtt InitialDataLoad.GlueJobRunId
+  InitialLoadExecutionArn:
+    Description: Execucao Step Functions da carga inicial concluida.
+    Value: !GetAtt InitialDataLoad.WorkflowExecutionArn
