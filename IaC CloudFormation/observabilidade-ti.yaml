@@ -10,8 +10,17 @@ Parameters:
   DatabaseVolumeId:
     Type: String
     Description: ID do volume EBS do banco de dados da stack principal.
+  DatabaseStandbyInstanceId:
+    Type: AWS::EC2::Instance::Id
+    Description: ID da instancia MySQL standby na AZ1 da stack principal.
+  DatabaseStandbyVolumeId:
+    Type: String
+    Description: ID do volume EBS do MySQL standby na AZ1 da stack principal.
   RabbitMqInstanceId:
     Type: AWS::EC2::Instance::Id
+  RabbitMqInstanceAz2Id:
+    Type: AWS::EC2::Instance::Id
+    Description: ID da instancia RabbitMQ independente na AZ2 da stack principal.
   SwarmManagerInstanceId:
     Type: AWS::EC2::Instance::Id
   WebAz1InstanceId:
@@ -62,8 +71,10 @@ Resources:
               "properties": {
                 "title": "CPU por instancia (%)", "region": "${AWS::Region}", "stat": "Average", "period": 300,
                 "metrics": [
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL"}],
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL primario AZ2"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseStandbyInstanceId}", {"label": "MySQL standby AZ1"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ AZ1"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RabbitMqInstanceAz2Id}", {"label": "RabbitMQ independente AZ2"}],
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Swarm manager"}],
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
@@ -77,8 +88,10 @@ Resources:
               "properties": {
                 "title": "Falhas de status EC2", "region": "${AWS::Region}", "stat": "Maximum", "period": 60,
                 "metrics": [
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL"}],
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL primario AZ2"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${DatabaseStandbyInstanceId}", {"label": "MySQL standby AZ1"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ AZ1"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${RabbitMqInstanceAz2Id}", {"label": "RabbitMQ independente AZ2"}],
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager"}],
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
@@ -92,8 +105,10 @@ Resources:
               "properties": {
                 "title": "Operacoes do volume EBS do MySQL", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
                 "metrics": [
-                  ["AWS/EBS", "VolumeReadOps", "VolumeId", "${DatabaseVolumeId}", {"label": "Leituras"}],
-                  ["AWS/EBS", "VolumeWriteOps", "VolumeId", "${DatabaseVolumeId}", {"label": "Gravacoes"}]
+                  ["AWS/EBS", "VolumeReadOps", "VolumeId", "${DatabaseVolumeId}", {"label": "Leituras primario AZ2"}],
+                  ["AWS/EBS", "VolumeWriteOps", "VolumeId", "${DatabaseVolumeId}", {"label": "Gravacoes primario AZ2"}],
+                  ["AWS/EBS", "VolumeReadOps", "VolumeId", "${DatabaseStandbyVolumeId}", {"label": "Leituras standby AZ1"}],
+                  ["AWS/EBS", "VolumeWriteOps", "VolumeId", "${DatabaseStandbyVolumeId}", {"label": "Gravacoes standby AZ1"}]
                 ]
               }
             },
@@ -137,6 +152,57 @@ Resources:
       Dimensions:
         - Name: InstanceId
           Value: !Ref DatabaseInstanceId
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref OperationsTopic]
+
+  DatabaseStandbyStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-mysql-standby-status-ec2'
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref DatabaseStandbyInstanceId
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref OperationsTopic]
+
+  RabbitMqStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-rabbitmq-az1-status-ec2'
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref RabbitMqInstanceId
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref OperationsTopic]
+
+  RabbitMqAz2StatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-rabbitmq-az2-status-ec2'
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref RabbitMqInstanceAz2Id
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 2

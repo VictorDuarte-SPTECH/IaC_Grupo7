@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Infraestrutura principal da Lamar Auto Pecas: VPC em duas zonas de
   disponibilidade, instancias EC2, volume EBS, Application Load Balancer,
-  bastion SSH, manager Docker Swarm e servico RabbitMQ dedicado.
+  bastion SSH, manager Docker Swarm, MySQL com recuperacao automatica entre
+  AZs e dois brokers RabbitMQ independentes.
 
 Parameters:
   EnvironmentName:
@@ -230,7 +231,7 @@ Resources:
     Properties:
       Handle: !Ref BootstrapSignalHandle
       Timeout: '3600'
-      Count: 8
+      Count: 10
 
   Vpc:
     Type: AWS::EC2::VPC
@@ -612,6 +613,33 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-sg-banco'
 
+  DatabaseBackupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref DatabaseSecurityGroup
+
+  DatabasePrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Sub '${EnvironmentName}.internal'
+      VPCs:
+        - VPCId: !Ref Vpc
+          VPCRegion: !Ref AWS::Region
+
+  DatabaseEndpointRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref DatabasePrivateHostedZone
+      Name: !Sub 'database.${EnvironmentName}.internal'
+      Type: A
+      TTL: '10'
+      ResourceRecords:
+        - !GetAtt DatabaseInstance.PrivateIp
+
   BastionInstance:
     Type: AWS::EC2::Instance
     DependsOn:
@@ -747,13 +775,16 @@ Resources:
             backend:
               image: ${DockerHubNamespace}/codetracker-backend:${ApplicationImageTag}
               environment:
-                DB_HOST: '${DatabaseInstance.PrivateIp}'
+                DB_HOST: '${DatabaseEndpointRecord}'
                 DB_NAME: '${DatabaseName}'
                 DB_USERNAME: '${DatabaseUser}'
                 SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
-                SPRING_RABBITMQ_HOST: '${RabbitMqInstance.PrivateIp}'
+                SPRING_RABBITMQ_ADDRESSES: '${RabbitMqInstance.PrivateIp}:5672,${RabbitMqInstanceAz2.PrivateIp}:5672'
                 SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
-                JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0'
+                SPRING_DATASOURCE_HIKARI_CONNECTIONTIMEOUT: '10000'
+                SPRING_DATASOURCE_HIKARI_VALIDATIONTIMEOUT: '5000'
+                SPRING_DATASOURCE_HIKARI_MAXLIFETIME: '60000'
+                JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0 -Dsun.net.inetaddr.ttl=10'
               secrets:
                 - source: database_password
                   target: DB_PASSWORD
@@ -895,14 +926,18 @@ Resources:
               --region '${AWS::Region}' \
               --name '/${EnvironmentName}/database/ready' \
               --query Parameter.Value --output text 2>/dev/null || true)
-            if [ "$DATABASE_STACK" = '${AWS::StackId}' ]; then
+            STANDBY_STACK=$(aws ssm get-parameter \
+              --region '${AWS::Region}' \
+              --name '/${EnvironmentName}/database/standby-ready' \
+              --query Parameter.Value --output text 2>/dev/null || true)
+            if [ "$DATABASE_STACK" = '${AWS::StackId}' ] && [ "$STANDBY_STACK" = '${AWS::StackId}' ]; then
               DATABASE_READY=true
               break
             fi
             sleep 10
           done
           if [ "$DATABASE_READY" != true ]; then
-            echo "A importacao do banco nao foi concluida." >&2
+            echo "A importacao do banco ou a primeira copia na AZ1 nao foi concluida." >&2
             exit 1
           fi
 
@@ -1195,6 +1230,81 @@ Resources:
             --volume rabbitmq-data:/var/lib/rabbitmq \
             rabbitmq:4-management-alpine
 
+          for attempt in $(seq 1 60); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" = healthy ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" != healthy ]; then
+            echo "RabbitMQ AZ1 nao ficou saudavel." >&2
+            exit 1
+          fi
+
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+
+  RabbitMqInstanceAz2:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - BackendSubnetAz2RouteTableAssociation
+      - PrivateDefaultRouteAz2
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref RabbitMqSecurityGroup
+            - !Ref PrivateSshSecurityGroup
+          SubnetId: !Ref BackendSubnetAz2
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-rabbitmq-az2'
+      UserData:
+        Fn::Base64: !Sub
+        - |
+          #!/bin/bash
+          BOOTSTRAP_RESOURCE=RabbitMqInstanceAz2
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
+
+          install_packages docker.io openssh-server ca-certificates curl
+          hostnamectl set-hostname rabbitmq-az2
+          systemctl enable --now docker
+          systemctl enable --now ssh
+          usermod -aG docker ubuntu
+
+          docker volume create rabbitmq-data
+          docker run --detach \
+            --name rabbitmq \
+            --hostname rabbitmq-az2 \
+            --restart unless-stopped \
+            --publish 5672:5672 \
+            --publish 15672:15672 \
+            --health-cmd 'rabbitmq-diagnostics -q ping' \
+            --health-interval 30s \
+            --health-timeout 10s \
+            --health-retries 5 \
+            --env RABBITMQ_DEFAULT_USER='${RabbitMqUser}' \
+            --env RABBITMQ_DEFAULT_PASS='${RabbitMqPassword}' \
+            --volume rabbitmq-data:/var/lib/rabbitmq \
+            rabbitmq:4-management-alpine
+
+          for attempt in $(seq 1 60); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" = healthy ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" != healthy ]; then
+            echo "RabbitMQ AZ2 nao ficou saudavel." >&2
+            exit 1
+          fi
+
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
   DatabaseDataVolume:
@@ -1325,6 +1435,10 @@ Resources:
           CREATE USER IF NOT EXISTS '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
           ALTER USER '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
           GRANT ALL PRIVILEGES ON `${DatabaseName}`.* TO '${DatabaseUser}'@'10.0.0.%';
+          CREATE USER IF NOT EXISTS 'codetracker_backup'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
+          ALTER USER 'codetracker_backup'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
+          GRANT SELECT, SHOW VIEW, TRIGGER, EVENT ON `${DatabaseName}`.* TO 'codetracker_backup'@'10.0.0.%';
+          GRANT SHOW_ROUTINE ON *.* TO 'codetracker_backup'@'10.0.0.%';
           FLUSH PRIVILEGES;
           SQL
 
@@ -1365,6 +1479,436 @@ Resources:
       Device: /dev/sdf
       InstanceId: !Ref DatabaseInstance
       VolumeId: !Ref DatabaseDataVolume
+
+  DatabaseStandbyDataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !GetAtt BackendSubnetAz1.AvailabilityZone
+      Size: 20
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-volume-dados-banco-az1'
+
+  DatabaseStandbyInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - BackendSubnetAz1RouteTableAssociation
+      - PrivateDefaultRouteAz1
+      - DatabaseBackupIngress
+    Metadata:
+      RecoveryAgent: |
+        #!/usr/bin/env python3
+        import fcntl
+        import json
+        import logging
+        import os
+        from pathlib import Path
+        import subprocess
+        import sys
+        import time
+
+        class Recovery:
+            def __init__(self, config):
+                self.config = config
+                self.state = Path(config["state_dir"])
+                self.state.mkdir(mode=0o700, parents=True, exist_ok=True)
+                self.latest = self.state / "latest.sql"
+                self.prepared = self.state / "promotion-prepared"
+                self.promoted = self.state / "promoted"
+
+            def run(self, args, *, stdin=None, stdout=subprocess.PIPE, timeout=30):
+                result = subprocess.run(
+                    args, stdin=stdin, stdout=stdout, stderr=subprocess.PIPE, timeout=timeout
+                )
+                if result.returncode:
+                    raise RuntimeError(
+                        f"{args[0]} falhou: {result.stderr.decode(errors='replace').strip()}"
+                    )
+                return result.stdout
+
+            def aws(self, *args):
+                output = self.run([
+                    "aws", "--region", self.config["region"], "--output", "json",
+                    "--cli-connect-timeout", "5", "--cli-read-timeout", "20", *args
+                ], timeout=45)
+                return json.loads(output)
+
+            def local(self, sql):
+                return self.run([
+                    "mysql", "--protocol=socket", "--user=root", "--batch",
+                    "--skip-column-names", "--execute", sql
+                ]).decode().strip()
+
+            def write_state(self, path, value, mode=0o600):
+                temporary = path.with_suffix(".tmp")
+                with temporary.open("w") as output:
+                    os.fchmod(output.fileno(), mode)
+                    output.write(value)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temporary.replace(path)
+                descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+
+            def validate(self):
+                database = self.config["database"]
+                count = self.local(
+                    "SELECT COUNT(*) FROM information_schema.tables "
+                    f"WHERE table_schema = '{database}';"
+                )
+                if int(count) == 0:
+                    raise RuntimeError("Copia sem tabelas; promocao bloqueada.")
+                self.local(f"SELECT COUNT(*) FROM `{database}`.usuario;")
+
+            def restore(self, snapshot):
+                try:
+                    self.local("SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;")
+                    with snapshot.open("rb") as source:
+                        self.run([
+                            "mysql", "--protocol=socket", "--user=root",
+                            "--default-character-set=utf8mb4"
+                        ], stdin=source, timeout=1800)
+                    self.validate()
+                finally:
+                    self.local("SET GLOBAL read_only=ON; SET GLOBAL super_read_only=ON;")
+
+            def backup(self):
+                if self.prepared.exists() or self.promoted.exists():
+                    logging.info("AZ1 promovida; copia do antigo primario desativada.")
+                    return
+                started = time.time()
+                temporary = self.state / "next.sql"
+                with temporary.open("wb") as output:
+                    self.run([
+                        "mysqldump", "--defaults-extra-file=/etc/codetracker/primary.cnf",
+                        "--single-transaction", "--quick", "--skip-lock-tables",
+                        "--no-tablespaces", "--set-gtid-purged=OFF", "--routines",
+                        "--events", "--triggers", "--add-drop-database",
+                        "--databases", self.config["database"]
+                    ], stdout=output, timeout=1800)
+                    output.flush()
+                    os.fsync(output.fileno())
+                if temporary.stat().st_size == 0:
+                    raise RuntimeError("Dump vazio; a ultima copia valida foi preservada.")
+                self.restore(temporary)
+                os.utime(temporary, (started, started))
+                # Link keeps the last valid snapshot available during an atomic replacement.
+                if self.latest.exists():
+                    previous = self.state / "previous.sql"
+                    previous.unlink(missing_ok=True)
+                    os.link(self.latest, previous)
+                temporary.replace(self.latest)
+                self.write_state(self.state / "last-backup", str(int(started)))
+                logging.info("Dump e restauracao AZ1 concluidos; snapshot iniciado em %s.", started)
+
+            def primary_healthy(self):
+                try:
+                    output = self.run([
+                        "mysql", "--defaults-extra-file=/etc/codetracker/primary.cnf",
+                        "--batch", "--skip-column-names", "--execute",
+                        f"SELECT 1 FROM `{self.config['database']}`.usuario LIMIT 1;"
+                    ], timeout=10)
+                    return output.strip() == b"1"
+                except (RuntimeError, subprocess.TimeoutExpired) as error:
+                    logging.error("MySQL AZ2 indisponivel: %s", error)
+                    return False
+
+            def primary_state(self):
+                result = self.aws(
+                    "ec2", "describe-instances", "--instance-ids", self.config["primary_id"]
+                )
+                return result["Reservations"][0]["Instances"][0]["State"]["Name"]
+
+            def fence(self):
+                state = self.primary_state()
+                if state in ("stopped", "terminated"):
+                    return
+                if state not in ("stopping", "shutting-down"):
+                    self.aws("ec2", "stop-instances", "--instance-ids", self.config["primary_id"])
+                for attempt in range(30):
+                    if self.primary_state() in ("stopped", "terminated"):
+                        logging.warning("Instancia AZ2 isolada; promocao autorizada.")
+                        return
+                    time.sleep(10)
+                raise RuntimeError("AWS nao confirmou o desligamento da AZ2; failover bloqueado.")
+
+            def publish(self):
+                batch = {
+                    "Changes": [{
+                        "Action": "UPSERT",
+                        "ResourceRecordSet": {
+                            "Name": self.config["endpoint"], "Type": "A", "TTL": 10,
+                            "ResourceRecords": [{"Value": self.config["standby_ip"]}]
+                        }
+                    }]
+                }
+                response = self.aws(
+                    "route53", "change-resource-record-sets",
+                    "--hosted-zone-id", self.config["zone_id"],
+                    "--change-batch", json.dumps(batch)
+                )
+                change_id = response["ChangeInfo"]["Id"]
+                for attempt in range(30):
+                    if self.aws("route53", "get-change", "--id", change_id)["ChangeInfo"]["Status"] == "INSYNC":
+                        return
+                    time.sleep(5)
+                raise RuntimeError("Alteracao DNS pendente; o monitor tentara novamente.")
+
+            def promote(self):
+                self.local("SELECT 1;")
+                if not self.latest.exists():
+                    raise RuntimeError("Nenhum dump completo disponivel; failover bloqueado.")
+                self.fence()
+                if not self.prepared.exists():
+                    age = max(0, int(time.time() - self.latest.stat().st_mtime))
+                    logging.warning("Promovendo AZ1 com snapshot de %s segundos.", age)
+                    self.restore(self.latest)
+                    # After this marker no retry may restore old data over new writes.
+                    self.write_state(self.prepared, str(int(time.time())))
+                role_config = Path(self.config["role_config"])
+                self.write_state(
+                    role_config, "[mysqld]\nread_only=OFF\nsuper_read_only=OFF\n", mode=0o644
+                )
+                self.local("SET GLOBAL super_read_only=OFF; SET GLOBAL read_only=OFF;")
+                self.publish()
+                self.write_state(self.promoted, str(int(time.time())))
+                logging.warning("Failover concluido: endpoint MySQL aponta para AZ1.")
+
+            def check(self):
+                if self.promoted.exists():
+                    self.local("SELECT 1;")
+                    return
+                if self.prepared.exists():
+                    self.promote()
+                    return
+                failures_path = self.state / "failures"
+                if self.primary_healthy():
+                    self.write_state(failures_path, "0")
+                    return
+                failures = int(failures_path.read_text()) if failures_path.exists() else 0
+                failures += 1
+                self.write_state(failures_path, str(failures))
+                logging.warning("Falha consecutiva do primario: %s/3.", failures)
+                if failures >= 3:
+                    self.promote()
+
+        def main():
+            os.umask(0o077)
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+            with open("/etc/codetracker/recovery.json") as source:
+                recovery = Recovery(json.load(source))
+            with (recovery.state / "recovery.lock").open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    logging.info("Outra operacao de recuperacao esta em andamento.")
+                    return
+                if sys.argv[1:] == ["backup"]:
+                    recovery.backup()
+                elif sys.argv[1:] == ["check"]:
+                    recovery.check()
+                else:
+                    raise ValueError("Use backup ou check.")
+
+        if __name__ == "__main__":
+            try:
+                main()
+            except (OSError, ValueError, KeyError, RuntimeError, subprocess.TimeoutExpired):
+                logging.exception("Operacao de recuperacao falhou.")
+                sys.exit(1)
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfileName
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref DatabaseSecurityGroup
+            - !Ref PrivateSshSecurityGroup
+          SubnetId: !Ref BackendSubnetAz1
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vm-banco-standby-az1'
+      UserData:
+        Fn::Base64: !Sub
+        - |
+          #!/bin/bash
+          BOOTSTRAP_RESOURCE=DatabaseStandbyInstance
+          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
+          ${BootstrapScript}
+
+          EBS_VOLUME_ID=$(printf '%s' '${DatabaseStandbyDataVolume}' | tr -d '-')
+          DEVICE=""
+          for attempt in $(seq 1 60); do
+            for candidate in "/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_$EBS_VOLUME_ID" /dev/xvdf /dev/sdf; do
+              if [ -b "$candidate" ]; then
+                DEVICE="$candidate"
+                break 2
+              fi
+            done
+            sleep 5
+          done
+          if [ -z "$DEVICE" ]; then
+            echo "Volume EBS da copia AZ1 nao encontrado." >&2
+            exit 1
+          fi
+          if ! blkid "$DEVICE" >/dev/null 2>&1; then
+            mkfs.ext4 "$DEVICE"
+          fi
+          EBS_UUID=$(blkid -s UUID -o value "$DEVICE")
+          mkdir -p /var/lib/mysql
+          if ! grep -q "UUID=$EBS_UUID /var/lib/mysql " /etc/fstab; then
+            echo "UUID=$EBS_UUID /var/lib/mysql ext4 defaults,nofail 0 2" >> /etc/fstab
+          fi
+          mountpoint -q /var/lib/mysql || mount /var/lib/mysql
+          rmdir /var/lib/mysql/lost+found 2>/dev/null || true
+
+          install_packages mysql-server python3 ca-certificates curl unzip openssh-server
+          install_aws_cli
+          hostnamectl set-hostname database-standby-az1
+          systemctl enable --now mysql ssh
+          umask 077
+          mkdir -p /etc/codetracker /var/lib/mysql/.codetracker-recovery
+          chmod 700 /var/lib/mysql/.codetracker-recovery
+          cat > /etc/mysql/mysql.conf.d/zz-lamar-network.cnf <<'MYSQL_CONFIG'
+          [mysqld]
+          bind-address = 0.0.0.0
+          mysqlx-bind-address = 127.0.0.1
+          event_scheduler = OFF
+          MYSQL_CONFIG
+          cat > /etc/mysql/mysql.conf.d/zz-standby-role.cnf <<'MYSQL_ROLE'
+          [mysqld]
+          read_only = ON
+          super_read_only = ON
+          MYSQL_ROLE
+          chmod 644 /etc/mysql/mysql.conf.d/zz-lamar-network.cnf /etc/mysql/mysql.conf.d/zz-standby-role.cnf
+          systemctl restart mysql
+          if [ "$(mysql --batch --skip-column-names --execute 'SELECT @@global.bind_address;')" != '0.0.0.0' ]; then
+            echo "MySQL AZ1 nao esta escutando na rede privada." >&2
+            exit 1
+          fi
+          mysql <<'SQL'
+          SET GLOBAL super_read_only=OFF;
+          SET GLOBAL read_only=OFF;
+          CREATE USER IF NOT EXISTS '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
+          ALTER USER '${DatabaseUser}'@'10.0.0.%' IDENTIFIED BY '${DatabasePassword}';
+          GRANT ALL PRIVILEGES ON `${DatabaseName}`.* TO '${DatabaseUser}'@'10.0.0.%';
+          SET GLOBAL read_only=ON;
+          SET GLOBAL super_read_only=ON;
+          SQL
+
+          cat > /etc/codetracker/primary.cnf <<'CLIENT'
+          [client]
+          host=${DatabaseInstance.PrivateIp}
+          user=codetracker_backup
+          password="${DatabasePassword}"
+          connect-timeout=5
+          CLIENT
+          IMDS_TOKEN=$(curl --fail --silent --show-error --request PUT \
+            --header "X-aws-ec2-metadata-token-ttl-seconds: 21600" \
+            http://169.254.169.254/latest/api/token)
+          PRIVATE_IP=$(curl --fail --silent --show-error \
+            --header "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+            http://169.254.169.254/latest/meta-data/local-ipv4)
+          cat > /etc/codetracker/recovery.json <<CONFIG
+          {
+            "region": "${AWS::Region}",
+            "primary_id": "${DatabaseInstance}",
+            "standby_ip": "$PRIVATE_IP",
+            "zone_id": "${DatabasePrivateHostedZone}",
+            "endpoint": "${DatabaseEndpointRecord}",
+            "database": "${DatabaseName}",
+            "state_dir": "/var/lib/mysql/.codetracker-recovery",
+            "role_config": "/etc/mysql/mysql.conf.d/zz-standby-role.cnf"
+          }
+          CONFIG
+          aws cloudformation describe-stack-resource \
+            --region '${AWS::Region}' --stack-name '${AWS::StackId}' \
+            --logical-resource-id DatabaseStandbyInstance \
+            --query StackResourceDetail.Metadata --output text \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["RecoveryAgent"], end="")' \
+            > /usr/local/sbin/codetracker-database-recovery
+          chmod 700 /usr/local/sbin/codetracker-database-recovery
+
+          DATABASE_READY=false
+          for attempt in $(seq 1 90); do
+            DATABASE_STACK=$(aws ssm get-parameter \
+              --region '${AWS::Region}' --name '/${EnvironmentName}/database/ready' \
+              --query Parameter.Value --output text 2>/dev/null || true)
+            if [ "$DATABASE_STACK" = '${AWS::StackId}' ]; then
+              DATABASE_READY=true
+              break
+            fi
+            sleep 10
+          done
+          if [ "$DATABASE_READY" != true ]; then
+            echo "Primario nao concluiu o bootstrap; nenhuma copia foi criada." >&2
+            exit 1
+          fi
+          BOOTSTRAP_STAGE=initial-database-backup
+          /usr/local/sbin/codetracker-database-recovery backup
+
+          cat > /etc/systemd/system/codetracker-database-backup.service <<'SERVICE'
+          [Unit]
+          Description=Copia automatica do MySQL AZ2 para AZ1
+          After=network-online.target mysql.service
+          Requires=mysql.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/codetracker-database-recovery backup
+          TimeoutStartSec=65min
+          SERVICE
+          cat > /etc/systemd/system/codetracker-database-backup.timer <<'TIMER'
+          [Unit]
+          Description=Dump MySQL a cada 12 horas
+          [Timer]
+          OnCalendar=*-*-* 00,12:00:00 UTC
+          Persistent=true
+          [Install]
+          WantedBy=timers.target
+          TIMER
+          cat > /etc/systemd/system/codetracker-database-failover.service <<'SERVICE'
+          [Unit]
+          Description=Verifica MySQL AZ2 e promove AZ1 com isolamento do primario
+          After=network-online.target mysql.service
+          Requires=mysql.service
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/codetracker-database-recovery check
+          TimeoutStartSec=45min
+          SERVICE
+          cat > /etc/systemd/system/codetracker-database-failover.timer <<'TIMER'
+          [Unit]
+          Description=Monitor automatico do banco a cada 30 segundos
+          [Timer]
+          OnBootSec=30s
+          OnUnitInactiveSec=30s
+          AccuracySec=1s
+          [Install]
+          WantedBy=timers.target
+          TIMER
+          systemctl daemon-reload
+          systemctl enable --now codetracker-database-backup.timer codetracker-database-failover.timer
+          aws ssm put-parameter \
+            --region '${AWS::Region}' --name '/${EnvironmentName}/database/standby-ready' \
+            --type String --value '${AWS::StackId}' --overwrite
+          BOOTSTRAP_STAGE=configuration
+        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+
+  DatabaseStandbyDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref DatabaseStandbyInstance
+      VolumeId: !Ref DatabaseStandbyDataVolume
 
   WebInstanceAz1:
     Type: AWS::EC2::Instance
@@ -1605,19 +2149,31 @@ Outputs:
     Value: !Sub 'sftp -i <chave.pem> -o ProxyJump=ubuntu@${BastionEip} ubuntu@${SwarmManagerInstance.PrivateIp}'
 
   DatabasePrivateIp:
-    Description: Endereco IP privado da instancia EC2 do banco de dados.
+    Description: IP do banco original AZ2; nao acompanha o failover. Use DatabaseEndpoint.
     Value: !GetAtt DatabaseInstance.PrivateIp
+
+  DatabaseEndpoint:
+    Description: Nome DNS privado usado pelo backend; muda para AZ1 apos failover automatico.
+    Value: !Ref DatabaseEndpointRecord
 
   DatabaseJdbcUrl:
     Description: URL JDBC privada utilizada pelo backend.
-    Value: !Sub 'jdbc:mysql://${DatabaseInstance.PrivateIp}:3306/${DatabaseName}'
+    Value: !Sub 'jdbc:mysql://${DatabaseEndpointRecord}:3306/${DatabaseName}'
+
+  DatabaseStandbyPrivateIp:
+    Description: IP privado do MySQL de recuperacao na AZ1.
+    Value: !GetAtt DatabaseStandbyInstance.PrivateIp
+
+  DatabaseStandbySshCommand:
+    Description: Acesso ao banco de recuperacao e seus logs de dump e failover.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${DatabaseStandbyInstance.PrivateIp}'
 
   RabbitMqPrivateIp:
     Description: Endereco IP privado da instancia EC2 do RabbitMQ.
     Value: !GetAtt RabbitMqInstance.PrivateIp
 
   RabbitMqAmqpEndpoint:
-    Description: Endpoint AMQP privado acessivel pelas instancias backend.
+    Description: Broker independente AZ1; filas nao sao replicadas para AZ2.
     Value: !Sub 'amqp://${RabbitMqInstance.PrivateIp}:5672'
 
   RabbitMqSshCommand:
@@ -1627,3 +2183,19 @@ Outputs:
   RabbitMqManagementTunnelCommand:
     Description: Tunel SSH para acessar a interface RabbitMQ em http://localhost:15672.
     Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15672:localhost:15672 ubuntu@${RabbitMqInstance.PrivateIp}'
+
+  RabbitMqAz2PrivateIp:
+    Description: IP privado do segundo broker independente na AZ2.
+    Value: !GetAtt RabbitMqInstanceAz2.PrivateIp
+
+  RabbitMqAddresses:
+    Description: Lista de brokers enviada ao Spring AMQP; nao replica filas ou mensagens.
+    Value: !Sub '${RabbitMqInstance.PrivateIp}:5672,${RabbitMqInstanceAz2.PrivateIp}:5672'
+
+  RabbitMqAz2SshCommand:
+    Description: Acesso SSH ao broker independente AZ2 pelo bastion.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${RabbitMqInstanceAz2.PrivateIp}'
+
+  RabbitMqAz2ManagementTunnelCommand:
+    Description: Tunel local 15673 para o painel do broker AZ2.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15673:localhost:15672 ubuntu@${RabbitMqInstanceAz2.PrivateIp}'

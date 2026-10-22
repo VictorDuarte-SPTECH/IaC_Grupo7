@@ -94,6 +94,7 @@ for scenario in success recovery install-recovery failure-window failure-offline
 done
 
 manager_service=$(awk '
+  { sub(/\r$/, "") }
   /^          cat > \/usr\/local\/sbin\/label-swarm-workers <<'\''SCRIPT'\''/ { extracting = 1; next }
   extracting && /^          SCRIPT$/ { exit }
   extracting { sub(/^          /, ""); sub(/\r$/, ""); print }
@@ -222,7 +223,7 @@ for row_count in 1 0; do
 done
 printf 'PASS: senha do administrador com BCrypt e falha se usuario nao existir\n'
 
-for resource in BastionInstance SwarmManagerInstance BackendInstanceAz1 BackendInstanceAz2 RabbitMqInstance DatabaseInstance WebInstanceAz1 WebInstanceAz2; do
+for resource in BastionInstance SwarmManagerInstance BackendInstanceAz1 BackendInstanceAz2 RabbitMqInstance RabbitMqInstanceAz2 DatabaseInstance DatabaseStandbyInstance WebInstanceAz1 WebInstanceAz2; do
   script=$(awk -v resource="$resource" '
     $0 ~ "^  " resource ":" { selected = 1; next }
     selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
@@ -248,9 +249,9 @@ for resource in BastionInstance SwarmManagerInstance BackendInstanceAz1 BackendI
   [[ "$instance" == *'IamInstanceProfile: !Ref InstanceProfileName'* ]]
   [[ "$instance" != *'BronzeLogsWritePolicy'* ]]
 done
-grep -Fq 'Count: 8' "$template"
+grep -Fq 'Count: 10' "$template"
 ! grep -Eiq 'fluent.?bit|BronzeLogs|AWS::S3::Bucket|s3:PutObject' "$template"
-printf 'PASS: oito scripts validos sem Fluent Bit nem acesso a buckets\n'
+printf 'PASS: dez scripts validos sem Fluent Bit nem acesso a buckets\n'
 grep -Fq 'systemctl start --no-block label-swarm-workers.service' "$template"
 alb_dependencies=$(awk '/^  ApplicationLoadBalancer:/ { extracting = 1; next } extracting && /^    Properties:/ { exit } extracting { print }' "$template")
 [[ "$alb_dependencies" == *InternetGatewayAttachment* && "$alb_dependencies" == *PublicDefaultRoute* ]]
@@ -263,4 +264,9 @@ grep -Fq 'BOOTSTRAP_STAGE=database-import' "$template"
 grep -Fq 'git clone --depth 1 https://github.com/EnzoServilha/Banco_Grupo7.git "$CLONE_DIR/repo"' "$template"
 grep -Fq -- '--logical-resource-id SwarmManagerInstance' "$template"
 grep -Fq -- '--status FAILURE' "$template"
-printf 'PASS: oito scripts compostos validos e abaixo de 16 KiB antes da substituicao de parametros\n'
+grep -Fq "DB_HOST: '\${DatabaseEndpointRecord}'" "$template"
+grep -Fq 'OnCalendar=*-*-* 00,12:00:00 UTC' "$template"
+grep -Fq 'OnUnitInactiveSec=30s' "$template"
+grep -Fq 'SPRING_RABBITMQ_ADDRESSES:' "$template"
+grep -Fq "'/\${EnvironmentName}/database/standby-ready'" "$template"
+printf 'PASS: dez scripts compostos validos e abaixo de 16 KiB antes da substituicao de parametros\n'

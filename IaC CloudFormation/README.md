@@ -1,15 +1,17 @@
 # Deploy da aplicacao com CloudFormation e Docker Swarm
 
 O template `cloudformationCodeTracker.yaml` instala Docker nas VMs da
-aplicacao, MySQL na VM de banco e RabbitMQ em uma VM dedicada. O manager
-descobre os quatro workers, aplica labels e executa `docker stack deploy`.
+aplicacao, MySQL principal na AZ2, MySQL de recuperacao na AZ1 e dois
+RabbitMQ independentes, um por AZ. A copia do banco a cada 12 horas e o
+failover para AZ1 sao automaticos. O manager descobre os quatro workers,
+aplica labels e executa `docker stack deploy`.
 
 ## 0. Preparar o ambiente
 
 Este roteiro sobe a infraestrutura AWS pelo console do CloudFormation.
 Nao e necessario executar os projetos Terraform, LocalStack ou o Compose
-local para este deploy. O template principal cria a rede, oito EC2, dois NAT
-Gateways, ALB, volume de banco e o cluster Swarm com a aplicacao.
+local para este deploy. O template principal cria a rede, dez EC2, dois NAT
+Gateways, ALB, dois volumes de banco, DNS privado e o cluster Swarm.
 O painel e os alertas sao uma segunda stack opcional, descrita no passo 4.
 
 1. Disponibilize as pastas `IaC_Grupo7`, `BackEnd_Grupo7`, `FrontEnd_Grupo7`,
@@ -25,8 +27,8 @@ O painel e os alertas sao uma segunda stack opcional, descrita no passo 4.
    `codetracker-etiquetas`.
 4. Entre no console AWS e selecione uma regiao com pelo menos duas AZs.
    Em laboratorios, inicie a sessao do laboratorio antes de abrir o console.
-   Confira cotas e permissoes para oito EC2 `t3.small`, dois NAT Gateways,
-   tres Elastic IPs, ALB, VPC, EBS, SSM e CloudFormation.
+   Confira cotas e permissoes para dez EC2 `t3.small`, dois NAT Gateways,
+   tres Elastic IPs, ALB, VPC, EBS, SSM, Route 53 e CloudFormation.
 5. Em EC2 > Key pairs, crie ou selecione um par de chaves na mesma regiao.
    Guarde o arquivo privado `.pem`: ele sera usado no acesso pelo bastion.
 6. Confira o instance profile que sera associado as VMs, como
@@ -125,8 +127,22 @@ SSM da AMI Ubuntu. O perfil das VMs precisa permitir `ssm:PutParameter` e
 `ssm:GetParameter` em `/<EnvironmentName>/swarm/*`, `kms:Decrypt` para ler o
 SecureString com a chave usada pelo SSM e `cloudformation:SignalResource` na
 stack. Tambem sao necessarias `ssm:PutParameter` e `ssm:GetParameter` em
-`/<EnvironmentName>/database/ready`. O usuario que cria a stack tambem precisa
-poder associar esse perfil.
+`/<EnvironmentName>/database/ready` e `/<EnvironmentName>/database/standby-ready`.
+Para instalar e operar a recuperacao automatica, esse perfil tambem precisa:
+
+| Permissao | Escopo necessario |
+| --- | --- |
+| `cloudformation:DescribeStackResource` | Stack principal, para baixar o agente incluido no Metadata |
+| `ec2:DescribeInstances` | `*`, para consultar o estado do banco AZ2 |
+| `ec2:StopInstances` | Somente a instancia fisica de `DatabaseInstance` |
+| `route53:ChangeResourceRecordSets` | Hosted zone privada `DatabasePrivateHostedZone` |
+| `route53:GetChange` | Alteracoes Route 53, recurso `arn:aws:route53:::change/*` |
+
+O template nao amplia as permissoes do instance profile existente. Configure-as
+antes de considerar o failover operacional; perfis de laboratorio podem ter
+restricoes que impedem essas acoes. A identidade que cria a stack precisa
+poder criar a hosted zone privada e associar o instance profile. Para
+restringir permissoes por recurso, use os IDs/ARNs da aba Resources da stack.
 
 ### Acompanhar a criacao
 
@@ -150,7 +166,7 @@ O manager publica `/<EnvironmentName>/swarm/stack-id` somente depois do IP e
 do token. Os workers so usam esses parametros quando o marcador corresponde
 ao ID da stack atual, evitando entrada em um cluster de uma implantacao antiga.
 Nao execute stacks simultaneas com o mesmo `EnvironmentName` na mesma regiao.
-Os oito bootstraps usam a mesma rotina definida em `Mappings.Bootstrap`:
+Os dez bootstraps usam a mesma rotina definida em `Mappings.Bootstrap`:
 
 - Atualizacao completa dos indices APT por IPv4, com timeout de ate 60 segundos
   por tentativa e janela total de 600 segundos. Tentativas ficam separadas por
@@ -169,10 +185,11 @@ Os oito bootstraps usam a mesma rotina definida em `Mappings.Bootstrap`:
   por uma URL S3 pre-assinada, sem depender da instalacao da AWS CLI ou de
   permissoes IAM adicionais para esse sinal. A URL e sensivel: nao a publique.
 
-O `BootstrapWaitCondition` exige oito sinais unicos em ate 3600 segundos.
+O `BootstrapWaitCondition` exige dez sinais unicos em ate 3600 segundos.
 Uma falha identifica o recurso logico e a etapa, por exemplo
 `WebInstanceAz1: apt-update-exhausted`; o motivo detalhado do APT fica no log.
-Isso inclui bastion, banco e RabbitMQ.
+Isso inclui bastion, os dois bancos e os dois RabbitMQ. A AZ1 so sinaliza
+sucesso depois de receber e restaurar o primeiro dump do principal.
 O sucesso do bootstrap do manager nao substitui o teste da aplicacao.
 
 O sinal pre-assinado precisa de acesso HTTPS ao endpoint S3 da URL, inclusive
@@ -190,7 +207,8 @@ configuracao inicial e inicia o verificador do Swarm em segundo plano. A
 verificar os workers, as replicas e as respostas HTTP da aplicacao. O manager
 aguarda ate 10 minutos pelos quatro workers antes de sinalizar falha; um worker
 ainda iniciando nao derruba a stack. Depois, aguarda ate 15 minutos pelo banco
-e 15 minutos pelas replicas e respostas HTTP. Falhas definitivas sao sinalizadas
+e pela primeira copia na AZ1, e 15 minutos pelas replicas e respostas HTTP.
+Falhas definitivas sao sinalizadas
 ao CloudFormation, em vez de aguardar o timeout. O prazo do manager e de ate
 60 minutos para acomodar
 recuperacao de rede, instalacao e prontidao da aplicacao. Os prazos da
@@ -236,7 +254,10 @@ O fluxo de acesso fica assim:
 Navegador -> ALB :80 -> frontend/Nginx nas VMs web
                      -> /api/ -> VIP do backend -> 4 replicas :8080 na rede overlay
                      -> /etiquetas-api/ -> etiquetas :8081 na rede overlay
-Backend -> MySQL :3306 na VM dedicada
+Backend -> database.<EnvironmentName>.internal:3306 -> MySQL AZ2
+                                                       -> AZ1 apos failover
+MySQL AZ2 -> dump automatico a cada 12h -> MySQL AZ1 (somente leitura)
+Backend -> RabbitMQ AZ1 ou AZ2 (brokers independentes, sem replicacao)
 Etiquetas -> backend :8080 na rede overlay
 ```
 
@@ -247,8 +268,54 @@ conexoes entre as quatro replicas por round-robin (nao e afinidade por usuario).
 O ALB distribui as conexoes externas entre os dois frontends. O manager fica
 em modo drain.
 Somente a porta do frontend e publicada; backend e etiquetas sao internos.
-O acesso MySQL fica restrito ao security group dos backends. O RabbitMQ esta
-disponivel para eles, mas o codigo atual do backend nao possui integracao AMQP.
+O acesso MySQL fica restrito aos backends e a comunicacao entre os bancos
+necessaria ao dump. Os dois RabbitMQ ficam acessiveis pelos backends.
+`SPRING_RABBITMQ_ADDRESSES` recebe os dois enderecos, mas o codigo atual do
+backend nao possui integracao AMQP: a lista so tera efeito quando a aplicacao
+usar Spring AMQP. Os brokers nao formam cluster; filas, mensagens, usuarios
+adicionais e definicoes criados em um nao sao copiados para o outro.
+Conectar ao segundo broker nao recupera as mensagens do primeiro.
+
+### Recuperacao automatica do MySQL
+
+Nao ha etapa manual para gerar dumps ou ativar a AZ1. O funcionamento e:
+
+1. No bootstrap, a AZ1 aguarda o banco AZ2 pronto, baixa um dump completo de
+   `lamar`, restaura e valida tabelas antes de liberar a aplicacao.
+2. O timer `codetracker-database-backup.timer` repete a copia diariamente as
+   00:00 e 12:00 UTC. O dump usa transacao consistente para tabelas InnoDB;
+   nao execute mudancas de schema durante a copia. O standby fica somente
+   leitura fora da restauracao. O snapshot anterior valido e preservado se
+   download, importacao ou validacao falharem.
+3. O timer `codetracker-database-failover.timer` verifica o MySQL AZ2 a cada
+   30 segundos, consultando a tabela de usuarios. Depois de tres falhas
+   consecutivas, o agente verifica o MySQL local e a existencia de um dump.
+4. O agente solicita o desligamento da EC2 AZ2 e so prossegue quando a AWS
+   confirma `stopped` ou `terminated`. Isso impede que o banco antigo e o novo
+   recebam escritas ao mesmo tempo. Sem confirmacao ou permissao IAM, a
+   promocao e bloqueada e o erro fica no journal; o monitor tenta novamente.
+5. A AZ1 restaura o ultimo dump valido, valida, habilita escrita e atualiza
+   o registro privado `DatabaseEndpoint` para seu proprio IP. Os quatro
+   backends usam esse nome, com TTL DNS de 10 segundos e cache Java limitado
+   a 10 segundos; o pool JDBC descarta conexoes quebradas e abre novas.
+
+Ha interrupcao durante deteccao, desligamento, restauracao e propagacao DNS.
+Requisicoes em andamento podem falhar: nao sao repetidas automaticamente,
+para evitar duplicar operacoes de escrita. As novas conexoes passam a usar
+a AZ1 sem editar parametros ou reimplantar os containers.
+Isso nao garante recuperacao de toda a aplicacao numa queda completa de AZ.
+
+A perda esperada e de ate aproximadamente 12 horas, mais o tempo da copia.
+Falhas nos dumps podem tornar o ultimo snapshot mais antigo; monitore a data
+de `last-backup` e os logs. Os dumps `latest.sql` e `previous.sql`, o estado
+de promocao e o MySQL standby ficam no EBS criptografado da AZ1. Dimensione
+os 20 GiB para banco, dumps e arquivo temporario; nao e backup externo nem
+historico de longo prazo.
+
+Depois da promocao, o agente para de copiar dados da AZ2 e nao retorna a ela
+automaticamente. Nunca reinicie o banco antigo como principal: ele estara
+desatualizado. Retomar a redundancia exige reconstruir um standby a partir
+do banco ativo, sem sobrescrever os dados novos da AZ1.
 
 ## 4. Subir o monitoramento opcional
 
@@ -263,7 +330,10 @@ Na aba Resources da stack principal, obtenha os IDs fisicos e preencha:
 | --- | --- |
 | `DatabaseInstanceId` | `DatabaseInstance` |
 | `DatabaseVolumeId` | `DatabaseDataVolume` |
+| `DatabaseStandbyInstanceId` | `DatabaseStandbyInstance` |
+| `DatabaseStandbyVolumeId` | `DatabaseStandbyDataVolume` |
 | `RabbitMqInstanceId` | `RabbitMqInstance` |
+| `RabbitMqInstanceAz2Id` | `RabbitMqInstanceAz2` |
 | `SwarmManagerInstanceId` | `SwarmManagerInstance` |
 | `WebAz1InstanceId` | `WebInstanceAz1` |
 | `WebAz2InstanceId` | `WebInstanceAz2` |
@@ -290,460 +360,30 @@ desse painel; `docker stats` cobre essa verificacao manual.
 ## 5. Encerrar o ambiente
 
 1. Interrompa o teste de carga e faca backup do banco se precisar dos dados.
-   Excluir a stack principal tambem exclui o volume de dados MySQL.
+   Excluir a stack principal tambem exclui os dois volumes MySQL e os dumps.
 2. Se criou a stack de observabilidade, exclua-a pelo CloudFormation e
    aguarde `DELETE_COMPLETE`.
-3. Exclua a stack principal pelo CloudFormation e aguarde `DELETE_COMPLETE`.
+3. Antes de excluir, acesse a AZ1 pelo `DatabaseStandbySshCommand` e pare os
+   timers com
+   `sudo systemctl stop codetracker-database-backup.timer codetracker-database-failover.timer`.
+   Aguarde qualquer copia/promocao ja em andamento terminar, para evitar
+   disparar failover durante a remocao dos recursos.
+   Se houve promocao, com a aplicacao ja fora de uso, devolva o registro A
+   `DatabaseEndpoint` ao IP original `DatabasePrivateIp` no Route 53 antes de
+   excluir: o valor alterado pelo agente pode causar divergencia na exclusao
+   do registro gerenciado pelo CloudFormation.
+   Exclua a stack principal pelo CloudFormation e aguarde `DELETE_COMPLETE`.
    Se algum recurso ficar em `DELETE_FAILED`, leia o motivo nos eventos e
    resolva a dependencia antes de repetir a exclusao.
 4. Confira se nao restaram recursos cobraveis da implantacao, especialmente
    NAT Gateways, Elastic IPs, EC2, ALB e EBS. Nao remova recursos de outras
    stacks ou ambientes.
 5. Os parametros SSM criados pelos scripts em
-   `/<EnvironmentName>/swarm/*` e `/<EnvironmentName>/database/ready` nao sao
+   `/<EnvironmentName>/swarm/*`, `/<EnvironmentName>/database/ready` e
+   `/<EnvironmentName>/database/standby-ready` nao sao
    recursos gerenciados pelo template. Depois de confirmar que nenhuma
    stack usa esse prefixo, remova somente esses parametros no Parameter Store,
    incluindo o token de entrada no Swarm.
-
-## Ingestao externa no Bronze: Ipeadata e Comex Stat
-
-O template separado `buckets+lambda.yml` coleta as duas fontes por HTTPS e
-grava as respostas JSON originais em pastas distintas. Nao converte para CSV,
-nao altera valores, nao deduplica nem transforma os registros. Validar HTTP,
-JSON e sucesso da consulta serve apenas para nao registrar uma falha como
-dataset valido. O mesmo template cria buckets Bronze, Silver, Gold e de artefatos,
-um job Glue de normalizacao e um database no Glue Data Catalog.
-O bucket Gold fica reservado para uso futuro, sem carga ou processamento.
-Athena nao e provisionado.
-Uma carga inicial obrigatoria coleta as duas fontes e executa o Glue antes
-de permitir que esta stack de dados conclua sua criacao.
-Cada nova stack tem recursos de dados proprios, sem reutilizar buckets de
-outra stack e sem depender de upload previo de script.
-
-### Fontes e recortes
-
-- Ipeadata: a pagina `https://ipeadata.gov.br/ExibeSerie.aspx?serid=31924`
-  corresponde a `BM_ERV`, taxa anual media de cambio comercial de venda.
-  A coleta salva toda a serie disponivel, inclusive valores ausentes,
-  usando `https://www.ipeadata.gov.br/api/odata4/Metadados('BM_ERV')/Valores`.
-- Comex Stat: os filtros foram recuperados de
-  `https://api-comexstat.mdic.gov.br/filter/162584`. A consulta salva e de
-  **importacao**, com os NCMs `84271011`, `84272010`, `84271019`, `84279000`,
-  `84312011` e `84312019`, detalhamento mensal por NCM, pais e UF e metricas
-  FOB, quilograma liquido e quantidade estatistica.
-- O coletor usa o POST `/general?language=pt` da
-  [API oficial](https://api-comexstat.mdic.gov.br/docs), sem abrir navegador,
-  clicar em Consultar ou resolver CAPTCHA. O CSV do botao verde e produzido
-  no navegador; o Bronze recebe o JSON bruto da API, nao uma reproducao
-  byte a byte desse CSV.
-- `ComexYears=25` significa 25 anos-calendario incluindo o ultimo ano
-  publicado. Com dados disponiveis ate setembro/2026, o intervalo e
-  janeiro/2002 a setembro/2026. O endpoint `/general/dates/updated` determina
-  o limite, evitando pedir meses futuros. A consulta original 2000-2026
-  cobre 27 anos e foi intencionalmente substituida pela janela de 25 anos.
-- Os seis NCMs ficam no parametro `ComexNcmCodes`; mudancas futuras no link
-  salvo nao alteram silenciosamente os filtros da Lambda. Para mudar o
-  recorte, atualize o parametro. Coletar todos os produtos do Brasil seria
-  outra escala de dados e nao faz parte desta configuracao.
-
-### Criar a stack e executar
-
-Crie uma stack separada no CloudFormation enviando `buckets+lambda.yml`.
-Se ja utiliza esse template, revise o change set: esta versao substitui o
-upload HTTP pela coleta e remove a Function URL publica e o output
-`UploadApiEndpoint`. Nao e mais possivel enviar arquivos pelo endpoint antigo.
-Os quatro buckets criados pelo template tem politica de retencao. Seus nomes
-sao gerados pelo CloudFormation, com sufixos exclusivos; consulte os outputs.
-Para outra implantacao independente, crie outra stack com outro nome.
-Um update da mesma stack atualiza seus recursos, nao cria um ambiente novo.
-
-Preencha os parametros:
-
-| Parametro | Valor inicial |
-| --- | --- |
-| `LambdaRoleName` | `LabRole`, ou outra role existente autorizada |
-| `GlueRoleName` | `LabRole`, ou outra role existente autorizada para Glue |
-| `WorkflowRoleName` | `LabRole`, ou outra role existente autorizada para Step Functions |
-| `InitialLoadRevision` | `1`; altere para solicitar nova carga inicial em um update |
-| `ScheduleState` | `DISABLED`; desliga so o agendamento mensal, nao a carga inicial |
-| `ScheduleExpression` | `cron(0 12 10 * ? *)`, dia 10 do mes as 12h UTC |
-| `ComexYears` | `25` |
-| `ComexNcmCodes` | Os seis codigos da consulta, ja preenchidos |
-
-Nao existem mais parametros para informar buckets existentes ou URI de script.
-Se atualizar uma stack da versao anterior, revise o change set: os antigos
-buckets de nome fixo podem ser substituidos por novos, mantendo os antigos
-retidos. Os dados anteriores nao sao copiados. As roles IAM continuam sendo
-pre-requisitos externos, assim como no template principal da aplicacao.
-
-A role precisa confiar em `lambda.amazonaws.com`, escrever objetos nos
-prefixos `ipeadata/*`, `comexstat/*` e `_metadata/*` do Bronze, publicar o
-script em `glue/*` no novo bucket de artefatos e publicar logs
-no CloudWatch (`logs:CreateLogStream` e `logs:PutLogEvents`). Se o bucket usa
-uma chave KMS gerenciada pelo cliente, sao necessarias as permissoes KMS e
-a key policy correspondentes. O usuario que implanta precisa poder passar
-a role para Lambda e criar os recursos de S3, Logs, Lambda e EventBridge.
-A Lambda nao usa VPC, evitando criar NAT Gateway para acessar essas APIs.
-
-Durante a criacao, a carga inicial ja executa ambas as fontes e o Glue.
-Para coletas adicionais depois de `CREATE_COMPLETE`, abra a funcao indicada
-no output `IngestionFunctionName`. No console Lambda, utilize:
-
-```json
-{"source": "ipeadata"}
-```
-
-```json
-{"source": "comexstat"}
-```
-
-Execute separadamente, confira o resultado, os logs e os objetos no S3.
-Uma execucao bem-sucedida retorna bucket e chaves; uma falha gera erro real,
-nao uma resposta HTTP 200 com mensagem de falha. Coletas manuais adicionais
-nao executam Glue automaticamente. Depois de validar a carga inicial,
-atualize `ScheduleState` para `ENABLED` se quiser recorrencia: a regra mensal
-dispara uma invocacao independente para cada fonte, somente no Bronze.
-
-### Carga inicial que bloqueia a conclusao da stack
-
-Depois de criar os buckets e a Lambda de bootstrap, `PublishGlueScript`
-publica automaticamente o script embutido no bucket de artefatos. O job
-Glue so e criado depois de receber a URI retornada por essa publicacao.
-Depois de provisionar funcoes, job Glue, catalogo e agendamento,
-o recurso `InitialDataLoad` inicia um workflow **Step Functions Standard**:
-
-```text
-CloudFormation: InitialDataLoad em CREATE_IN_PROGRESS
-  -> Lambda: Ipeadata -> Bronze + manifesto COMPLETE
-  -> Lambda: Comex Stat -> Bronze + manifesto COMPLETE
-  -> Glue: aguarda o job terminar com sucesso e publicar as duas tabelas Silver
-  -> Callback SUCCESS para CloudFormation
-  -> Stack pode atingir CREATE_COMPLETE
-```
-
-O Glue recebe explicitamente os dois manifestos gerados por esse workflow.
-Assim, um snapshot antigo ou uma coleta concorrente nao satisfaz a carga
-inicial por engano. O script aceita `--IPEADATA_MANIFEST` e
-`--COMEXSTAT_MANIFEST` e esta embutido em
-`Mappings.GlueScript.Silver.Code` do YAML. Esse bloco e a fonte unica do
-codigo Glue: editar o bloco e atualizar a stack publica a revisao no S3,
-sem arquivo `.py` externo ou comando `aws s3 cp`.
-
-Sao adicionados uma Lambda de bootstrap, seu grupo de logs com retencao de
-14 dias, uma state machine e dois recursos customizados CloudFormation
-(publicacao de script e carga inicial). A funcao
-de bootstrap inicia a orquestracao e retorna sem sinalizar sucesso antecipado;
-o callback so ocorre no final do workflow. Isso evita manter uma Lambda
-esperando um job Glue que pode durar mais que o limite de uma invocacao.
-
-Cada coleta continua limitada a 5 minutos e o Glue a 15 minutos. O workflow
-tem limite global de 2200 segundos; o recurso CloudFormation espera ate
-2400 segundos (40 minutos), permitindo os timeouts e as respostas finais.
-Se o callback nao chegar, CloudFormation falha por timeout, nunca assume
-sucesso por ausencia de resposta.
-
-**Qualquer falha impede a conclusao:** erro HTTP persistente, inclusive o
-429 ja observado no Comex, falta de dados, IAM insuficiente, script ausente,
-dependencia Glue indisponivel ou falha no Silver resultam em `FAILED`.
-Com rollback habilitado, a stack pode entrar em `ROLLBACK_IN_PROGRESS`.
-Nao ha fallback para dados antigos, nem opcao de ignorar uma das fontes.
-As escritas nao sao transacionais: pode haver Bronze parcial ou uma tabela
-Silver publicada antes de a outra falhar.
-
-O bootstrap usa a role `LambdaRoleName`, que agora tambem precisa de
-`states:StartExecution` na state machine e logs da funcao de bootstrap.
-`WorkflowRoleName` precisa confiar em `states.amazonaws.com` e permitir:
-
-- `lambda:InvokeFunction` nas funcoes de coleta e bootstrap.
-- `glue:StartJobRun`, `glue:GetJobRun`, `glue:GetJobRuns` e
-  `glue:BatchStopJobRun` para iniciar, acompanhar e tentar cancelar o job.
-
-A role Glue continua com suas permissoes de S3, catalogo e logs. Se todos os
-parametros usarem `LabRole`, essa role precisa confiar nos tres servicos:
-Lambda, Glue e Step Functions. O usuario que implanta tambem precisa poder
-criar/atualizar state machines e passar a role. O template nao cria nem
-altera essas permissoes.
-
-Acompanhe `InitialDataLoad` na aba Events e a execucao no console Step
-Functions. O motivo de falha inclui o ARN da execucao quando o callback
-consegue ser enviado. O historico contem a URL pre-assinada de callback do
-CloudFormation: restrinja acesso ao historico e nao compartilhe o input.
-Se callbacks ou a orquestracao falharem antes da resposta, investigue os
-logs e os timeouts; nao envie SUCCESS manualmente para contornar a validacao.
-
-Na conclusao, os outputs `InitialLoadWorkflowArn`, `InitialLoadExecutionArn`
-e `InitialLoadGlueRunId` identificam a state machine e as execucoes.
-Em updates, mudar os filtros, periodo, codigo Glue publicado ou
-`InitialLoadRevision` atualiza o recurso customizado e solicita nova carga.
-Mudar apenas o estado do agendamento nao solicita outra carga. Updates de
-codigo/roles sem mudar essas propriedades nao garantem reexecucao; incremente
-`InitialLoadRevision` quando quiser valida-los com uma carga nova.
-Nao reutilize uma URL de callback antiga para executar manualmente o workflow.
-
-Na exclusao do recurso customizado, ele responde sucesso sem iniciar coleta
-nem apagar dados. Os buckets criados continuam retidos mesmo em rollback;
-uma nova stack recebe outros nomes gerados e nao adota esses buckets
-antigos. Revise os recursos retidos para controlar custos e preservar
-dados necessarios. O catalogo/job podem ser removidos no rollback;
-dados retidos no Silver nao significam que a tabela continua registrada.
-
-**Custo:** criar esta stack agora executa duas coletas, um job Glue e
-transicoes Step Functions, mesmo com `ScheduleState=DISABLED`. Nao ha
-garantia de gratuidade. O agendamento mensal continua apenas no Bronze;
-execucoes Silver posteriores podem ser manuais.
-
-### Organizacao dos objetos e Glue
-
-```text
-Bronze/
-  ipeadata/serie=BM_ERV/ingestion_date=AAAA-MM-DD/run_id=.../page-0001.json
-  comexstat/consulta=162584/flow=import/ingestion_date=AAAA-MM-DD/run_id=.../response.json
-  _metadata/ipeadata/...
-  _metadata/comexstat/...
-```
-
-Cada resposta e salva com seus bytes originais. O prefixo `_metadata/` guarda
-origem, parametros da consulta, horario UTC, tamanho e SHA-256, separado dos
-dados para nao misturar esquemas no Glue. A Lambda retorna so as chaves,
-portanto o arquivo nao passa pelo limite de payload de uma Function URL.
-
-No Glue, leia separadamente `value` do JSON Ipeadata e `data.list` do Comex.
-O job incluido ja extrai esses envelopes, inclusive JSON multilinha, e valida
-o tamanho e o SHA-256 contra os metadados do Bronze antes de transformar.
-As regras de normalizacao e publicacao estao descritas abaixo.
-
-### Limites, falhas e custo
-
-O CSV mostrado tem aproximadamente 4,5 MB e 30.515 linhas, mas a resposta
-JSON pode ser maior. O coletor tem 512 MB de memoria, timeout de 300 segundos
-e limite de 32 MiB por resposta. Esses sao limites de seguranca, nao medicao
-do tempo da coleta completa na AWS. A consulta e montada dinamicamente sem
-transformar os registros; se ela exceder o limite, a execucao falha e sera
-necessario dividi-la por periodo ou mudar a estrategia de transferencia.
-
-Na verificacao das fontes, uma consulta Comex de janeiro a setembro/2026
-retornou JSON com sucesso, mas a tentativa seguinte para a janela de 25 anos
-recebeu **HTTP 429**. Portanto, o rate limit e um risco real: o codigo respeita
-`Retry-After` numerico de ate 60 segundos ou usa espera progressiva, com no
-maximo tres tentativas. Tambem repete erros HTTP transitorios e falhas de rede.
-Persistindo a falha, registra erro no CloudWatch e interrompe a execucao.
-O sucesso da consulta completa de 25 anos ainda depende de a fonte aceitar
-a requisicao; enquanto houver esse bloqueio, a carga inicial falhara e a
-stack nao sera marcada como completa.
-
-Invocacoes assincronas permitem uma repeticao da execucao; a entrega do
-EventBridge tambem tem retries limitados. Isso nao garante exatamente uma
-coleta: reexecucoes recebem outro `run_id` e geram snapshots novos. Falhas
-parciais podem deixar objetos sem todos os metadados ou paginas; so considere
-completa uma execucao com `manifest.json` de status `COMPLETE` em
-`_metadata/<fonte>/ingestion_date=.../run_id=.../`. O manifesto so e gravado
-depois dos dados e metadados de todas as paginas; use suas chaves como entrada
-para o Glue, evitando snapshots incompletos. Nao ha DLQ nem alerta
-por email configurado; monitore `Errors` e `Duration` no CloudWatch.
-Logs sao retidos por 14 dias.
-
-A [pagina de precos do Lambda](https://aws.amazon.com/lambda/pricing/)
-informa franquia de um milhao de requisicoes e 400.000 GB-s mensais.
-Com duas execucoes mensais de 512 MB que durem 300 segundos cada, seriam
-aproximadamente **300 GB-s por mes**, antes de testes e retries.
-E uma estimativa de consumo, nao garantia de custo zero: a franquia e
-compartilhada com outras funcoes e depende das regras da conta.
-
-S3 (armazenamento e requisicoes), CloudWatch, EventBridge, Glue e Athena
-possuem cobranca e elegibilidade proprias; nao estao incluidos nessa conta.
-Em particular, jobs Glue nao sao cobertos pela franquia do Lambda e o Athena
-cobra dados lidos nas consultas. Configure um AWS Budget e confira Billing
-antes de habilitar a rotina. Nao ha limite monetario automatico neste template.
-O Bronze nao expira snapshots automaticamente; considere retencao conforme
-o historico necessario, sem apagar dados ainda usados pelo Glue.
-
-Para validacao local, com o ambiente de `cfn-lint` disponivel:
-
-```powershell
-cfn-lint ".\IaC_Grupo7\IaC CloudFormation\buckets+lambda.yml"
-python ".\IaC_Grupo7\IaC CloudFormation\tests\bronze_ingestion_test.py"
-```
-
-## Glue: Bronze para Silver
-
-O job `BronzeToSilverJob` usa **Python Shell 3.9, 0.0625 DPU**, timeout de
-15 minutos, nenhuma repeticao automatica e uma execucao por vez. E uma
-configuracao de baixa capacidade para os arquivos pequenos atuais, nao um
-cluster Spark. As dependencias `numpy==1.26.4`, `pyarrow==14.0.2` e
-`boto3==1.34.162` sao instaladas pelo Glue ao iniciar. O job nao usa VPC,
-nao possui trigger mensal proprio. Ele e executado automaticamente pela
-carga inicial Step Functions e pode ser executado manualmente depois.
-
-### Implantar sem preparar buckets ou enviar scripts
-
-1. Crie uma nova stack enviando apenas `buckets+lambda.yml`. Bronze, Silver, Gold
-   e artefatos sao sempre buckets novos, privados e exclusivos dessa stack,
-   com retencao em exclusao ou substituicao.
-2. O codigo em `Mappings.GlueScript.Silver.Code` e publicado pela Lambda
-   de bootstrap no bucket de artefatos em
-   `glue/bronze_to_silver-<sha256>.py`. O hash versiona cada revisao.
-   Falha na publicacao bloqueia a criacao do job e da stack; nao existe
-   sucesso ficticio apontando para um script inexistente.
-3. Confira `GlueRoleName`: a role precisa confiar em `glue.amazonaws.com`.
-   Se usar a mesma `LabRole` da Lambda, ela precisa permitir ambos os
-   servicos na trust policy. O template nao cria nem modifica roles.
-4. A role Glue precisa de `s3:ListBucket` no Bronze, `s3:GetObject` nos dados,
-   metadados e no script do bucket de artefatos, `s3:PutObject` nos prefixos `datasets/*`, `_rejected/*`
-   e `_metadata/*` do Silver, acesso aos logs do Glue e permissoes
-   `glue:GetDatabase`, `glue:GetTable`, `glue:CreateTable` e `glue:UpdateTable`
-   no database/tabelas. Chaves KMS exigem as permissoes e key policies
-   correspondentes. O usuario que implanta precisa de permissoes Glue e
-   `iam:PassRole`, alem das permissoes da ingestao.
-   Se o catalogo/localizacao estiver sob controle do Lake Formation, tambem
-   conceda as permissoes Lake Formation de criacao/alteracao e acesso a dados;
-   somente IAM pode nao ser suficiente nesse ambiente.
-5. Revise o change set e acompanhe a carga inicial ate `CREATE_COMPLETE` ou
-   `UPDATE_COMPLETE`. Confira tambem as permissoes Step Functions descritas
-   acima; criar os recursos nao basta para a stack concluir.
-   Consulte os outputs `BronzeBucketName`, `SilverBucketName`, `GoldBucketName`,
-   `ArtifactsBucketName`, `GlueScriptS3Uri`, `SilverGlueJobName` e
-   `SilverCatalogDatabase`.
-
-### Executar o processamento
-
-A primeira execucao e automatica durante a criacao da stack. Para execucoes
-adicionais, confirme o manifesto `COMPLETE` da coleta Bronze e abra o job
-indicado por `SilverGlueJobName` no console Glue, utilizando Run.
-O argumento `--SOURCE` aceita:
-
-| Valor | Comportamento |
-| --- | --- |
-| `all` (padrao) | Processa Ipeadata e Comex, separadamente |
-| `ipeadata` | Processa somente a serie cambial |
-| `comexstat` | Processa somente as importacoes |
-
-Por exemplo, se o Comex ainda estiver bloqueado por HTTP 429 e so houver
-manifesto Ipeadata, execute com `--SOURCE=ipeadata`. Uma fonte sem manifesto
-completo gera falha explicita. No modo `all`, as duas fontes sao tentadas;
-se uma falhar, a outra ainda pode ser publicada, mas o job termina com erro.
-Nao existe transacao conjunta entre as duas tabelas.
-
-Para cada fonte, uma execucao manual sem argumentos de manifesto seleciona
-o manifesto com maior `LastModified` do S3. A carga inicial informa
-`--IPEADATA_MANIFEST` e `--COMEXSTAT_MANIFEST` para fixar seus proprios
-snapshots. Em ambos os casos, o job valida o status e garante que as chaves
-pertencem ao mesmo snapshot.
-Ele nao mistura paginas de execucoes diferentes e nao volta silenciosamente
-para um snapshot antigo se o mais recente estiver invalido. A leitura dos
-objetos e limitada a 32 MiB por objeto, como no coletor.
-
-### Tratamentos e esquemas
-
-As fontes permanecem separadas, sem conversao de USD para BRL e sem join.
-Nomes de colunas sao padronizados; textos sao aparados, mas nomes de paises,
-UFs e descricoes nao sao traduzidos nem convertidos para outros codigos.
-
-| Tabela | Colunas de negocio no Silver |
-| --- | --- |
-| `ipeadata` | `serie_codigo`, `data_referencia`, `ano`, `taxa_cambio`, `nivel`, `territorio_codigo` |
-| `comexstat` | `fluxo`, `data_referencia`, `ano`, `mes`, `ncm_codigo`, `ncm_descricao`, `pais`, `uf_produto`, `valor_fob_usd`, `quilograma_liquido`, `quantidade_estatistica` |
-
-As duas tabelas tambem recebem `bronze_key`, `bronze_run_id` e `data_ingestao`
-para rastreabilidade. As datas usam tipo `date`; ano/mes usam inteiros.
-NCM permanece texto de oito digitos, preservando zeros a esquerda.
-O mes Comex vira uma data de referencia no primeiro dia daquele mes.
-
-`taxa_cambio` usa `decimal(38,30)` para preservar inclusive os pequenos
-valores historicos em notacao cientifica. As tres metricas Comex usam
-`decimal(38,6)`, sem conversao intermediaria para ponto flutuante. Numeros
-negativos, nao finitos ou que exigiriam arredondamento/perda de precisao
-sao rejeitados. Nao ha tentativa de adivinhar separadores decimais diferentes
-do formato da API.
-
-Valor cambial explicitamente `null` e preservado como ausente, nao como zero.
-Ausencia do campo `VALVALOR` e erro de esquema. Datas, serie, NCM, dimensoes
-obrigatorias e metricas invalidas sao enviadas para rejeitados com motivo e
-chave Bronze; o objeto original continua intacto no Bronze.
-
-Duplicatas identicas dentro do snapshot sao removidas e contadas no relatorio.
-A chave Ipeadata e serie/data/nivel/territorio; a chave Comex e
-fluxo/mes/NCM/pais/UF. Se registros da mesma chave tiverem conteudos diferentes,
-todos os conflitantes sao rejeitados, sem escolher um vencedor arbitrario.
-
-### Escrita, rejeitados e consultas
-
-```text
-Silver/
-  datasets/ipeadata/snapshots/<processing_id>/data.parquet
-  datasets/comexstat/snapshots/<processing_id>/data.parquet
-  _rejected/<fonte>/processing_id=<id>/records.jsonl
-  _metadata/<fonte>/processing_id=<id>/report.json
-```
-
-Cada fonte gera um Parquet com compressao Snappy e esquema explicito.
-Para esse volume, nao ha particionamento por ano, evitando muitos arquivos
-pequenos. Cada execucao tem um novo `processing_id`; snapshots anteriores
-permanecem no S3. Nao ha exclusao nem expiracao automatica.
-
-O relatorio registra manifesto Bronze, horario, registros aceitos, rejeitados
-e duplicatas removidas. Rejeitados preservam o registro com o motivo; nao ha
-arquivo de rejeitados quando a contagem e zero. Se todos os registros forem
-invalidos, o job grava os rejeitados e um relatorio de falha, mas nao muda
-a tabela anteriormente publicada.
-
-Somente depois de escrever o Parquet, o job cria ou atualiza a tabela
-`ipeadata` ou `comexstat` no database indicado por `SilverCatalogDatabase`.
-A localizacao da tabela aponta apenas para aquele snapshot completo,
-evitando somar repetidamente o historico em reprocessamentos. Nao e
-necessario crawler nem `MSCK REPAIR TABLE`. Falha antes da publicacao preserva
-a localizacao anterior. Se a publicacao ocorrer e a gravacao do relatorio
-final falhar, o job reporta erro, mas a tabela ja pode apontar para dados
-validos; confira o catalogo e os logs.
-
-O Athena pode usar esse catalogo depois do primeiro processamento bem-sucedido.
-Configure separadamente workgroup, permissoes e bucket de resultados, selecione
-o database do output e consulte, por exemplo:
-
-```sql
-SELECT ano, SUM(valor_fob_usd) AS total_fob_usd
-FROM comexstat
-GROUP BY ano
-ORDER BY ano;
-```
-
-Nao aponte um crawler para `datasets/` inteiro nem inclua todos os snapshots
-em outra tabela: isso reintroduziria a duplicacao que a publicacao evita.
-Os prefixos `_rejected/` e `_metadata/` nao fazem parte das tabelas analiticas.
-Nao sao criados workgroup Athena, processamento Gold, trigger Glue mensal ou alarmes.
-Os logs Python Shell ficam em `/aws-glue/python-jobs/output` e
-`/aws-glue/python-jobs/error`, sem retencao gerenciada por este template.
-Excluir a stack remove o job e o database do catalogo, mas preserva os quatro
-buckets e seus objetos, incluindo os scripts publicados no bucket de
-artefatos. A limpeza desses dados e uma acao manual separada.
-
-### Custo e validacao do Glue
-
-O job e executado na carga inicial e cada Run adicional utiliza cobranca
-propria do Glue, nao a franquia do Lambda. A capacidade configurada e 0.0625 DPU;
-15 minutos representariam 0.015625 DPU-h por execucao, sujeitos ao preco,
-tempo efetivamente faturado e regras da regiao. Instalacao de dependencias,
-logs, catalogo, S3 e consultas Athena tambem devem ser considerados.
-Nao ha limite monetario nem garantia de gratuidade.
-
-O job usa memoria de uma unica maquina; aumentar significativamente o volume
-exige rever a capacidade ou migrar para Glue Spark. Reprocessar publica outro
-snapshot e pode gerar novas versoes logicas dos dados; nao ha bookmarks
-Python Shell nem garantia de processamento exatamente uma vez.
-
-Para testar o Parquet real localmente, use um ambiente Python isolado com
-as dependencias configuradas no job e PyYAML para ler o template:
-
-```powershell
-python -m venv .venv-glue-tests
-.\.venv-glue-tests\Scripts\python.exe -m pip install numpy==1.26.4 pyarrow==14.0.2 boto3==1.34.162 PyYAML==6.0.2
-.\.venv-glue-tests\Scripts\python.exe ".\IaC_Grupo7\IaC CloudFormation\tests\silver_glue_test.py"
-.\.venv-glue-tests\Scripts\python.exe -m unittest discover -s ".\IaC_Grupo7\IaC CloudFormation\tests" -p "*_test.py"
-```
-
-Use Python 3.9 a 3.11 para esse conjunto de dependencias. Os testes cobrem
-normalizacao, rejeitados, precisao decimal, integridade, selecao de manifestos,
-Parquet/Snappy, publicacao do catalogo, manifestos fixos e bloqueio da
-conclusao da stack em falhas da carga inicial. Eles nao executam jobs na AWS.
 
 ## Dados e credenciais
 
@@ -766,9 +406,10 @@ A importacao so ocorre em banco sem tabelas. O commit importado fica registrado
 em `/var/lib/mysql/.lamar-import-complete`, no EBS. Um banco com tabelas e sem
 esse marcador bloqueia o bootstrap para evitar sobrescrever dados ou repetir
 inserts; uma importacao parcial exige revisao manual, nao exclusao automatica.
-O manager aguarda o parametro SSM `/<EnvironmentName>/database/ready` contendo
-o ID da stack atual antes de subir os containers. O backend ja recebe IP,
-nome, usuario e senha desse MySQL, sem precisar de uma nova imagem.
+O manager aguarda os parametros SSM `/<EnvironmentName>/database/ready` e
+`/<EnvironmentName>/database/standby-ready` contendo o ID da stack atual antes
+de subir os containers. O backend recebe DNS privado estavel, nome, usuario
+e senha do MySQL, sem precisar de uma nova imagem.
 O bootstrap grava `zz-lamar-network.cnf` depois do `mysqld.cnf` padrao para
 escutar na rede privada e confirma o `bind_address` antes de sinalizar sucesso.
 
@@ -817,19 +458,53 @@ falha de sinalizacao, sem acessar AWS nem aguardar os intervalos reais.
 
 Evite compartilhar logs ou arquivos que contenham credenciais.
 
+No banco AZ1, acessivel pelo output `DatabaseStandbySshCommand`, confira:
+
+```bash
+sudo systemctl list-timers 'codetracker-database-*'
+sudo journalctl -u codetracker-database-backup.service -n 100 --no-pager
+sudo journalctl -u codetracker-database-failover.service -n 100 --no-pager
+sudo ls -lh /var/lib/mysql/.codetracker-recovery/
+sudo cat /var/lib/mysql/.codetracker-recovery/last-backup
+sudo mysql -e 'SELECT @@global.read_only, @@global.super_read_only;'
+```
+
+`last-backup` contem o horario Unix do inicio da ultima copia bem-sucedida.
+Antes do failover, as duas variaveis de somente leitura devem ser `1`;
+depois, `0`. O arquivo `promoted` indica promocao concluida; se existir apenas
+`promotion-prepared`, consulte os logs de DNS/IAM. Nao apague esses marcadores:
+eles impedem restaurar um dump antigo por cima de escritas novas.
+
+Para um teste de failover em ambiente descartavel, confirme o primeiro dump
+e pare a EC2 `DatabaseInstance` (AZ2) pelo console. Observe a promocao nos
+logs da AZ1 e teste consulta e escrita pelo frontend apos a troca.
+Nao reinicie o antigo principal nem use esse teste com dados a preservar.
+Para o RabbitMQ, use `RabbitMqManagementTunnelCommand` (porta local 15672)
+ou `RabbitMqAz2ManagementTunnelCommand` (porta local 15673). Os paineis
+mostram brokers e filas separados, nao replicas.
+
+Testes offline do agente, sem acessar AWS nem MySQL:
+
+```powershell
+python -m unittest discover -s ".\IaC_Grupo7\IaC CloudFormation\tests" -p database_recovery_test.py
+```
+
 ## Limites
 
 - A automacao foi feita para criacao de uma stack nova. Mudar UserData ou a tag
   em uma stack existente nao garante reexecutar cloud-init nem atualizar os
   servicos automaticamente. Nao reutilize a WaitConditionHandle de uma criacao
   anterior em uma atualizacao; use uma stack nova para esta versao do bootstrap.
-- O manager, o banco e o RabbitMQ sao unicos: duas AZs nao tornam esses servicos
-  altamente disponiveis. Perder o manager impede novos agendamentos.
+- O manager e unico: perde-lo impede novos agendamentos. A recuperacao do
+  MySQL e unilateral (AZ2 para AZ1), com perda de dados e interrupcao, nao
+  replicacao continua nem RDS Multi-AZ. A perda da AZ1 remove o standby.
+- Os dois RabbitMQ sao independentes; nao ha sincronizacao de mensagens,
+  quorum ou garantia de continuidade dos consumidores.
 - O ALB usa HTTP. Configure HTTPS e cookies seguros antes de uso em producao.
 - O SSH publico do bastion continua aberto no template; restrinja ao seu IP.
-- Ha custos com oito EC2 (`t3.small` por padrao), dois NAT Gateways, ALB,
-  EBS e IPs publicos.
-- Excluir a stack tambem exclui o volume do banco: faca backup antes.
+- Ha custos com dez EC2 (`t3.small` por padrao), dois NAT Gateways, ALB,
+  dois volumes de dados EBS, zona DNS privada, consultas DNS e IPs publicos.
+- Excluir a stack tambem exclui os volumes e dumps do banco: faca backup antes.
 
 O arquivo `../docker-compose.yml` continua sendo o ambiente local; a stack
 Swarm da AWS e gerada em `/opt/codetracker/stack.yml` no manager.
