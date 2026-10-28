@@ -1,5 +1,188 @@
 # Deploy da aplicacao com CloudFormation e Docker Swarm
 
+## Data lake (stack independente)
+
+O template `buckets+lambda.yml` cria buckets privados Bronze, Silver, Gold e
+Artifacts, upload HTTPS, ingestao Ipeadata/Comex e catalogacao Silver no Glue.
+Para implantar essa stack separadamente:
+
+```bash
+aws cloudformation deploy --stack-name datalake-grupo7 \
+  --template-file "IaC CloudFormation/buckets+lambda.yml"
+```
+
+Os nomes dos buckets sao gerados pelo CloudFormation com o nome da stack,
+o identificador logico da camada e um sufixo unico, por exemplo
+`codetracker-bronzebucket-<sufixo>`. Nao ha `BucketName` fixo no template:
+o CloudFormation adapta o nome as regras do S3, inclusive letras minusculas.
+Consulte `BronzeBucketName`, `SilverBucketName`, `GoldBucketName` e
+`ArtifactsBucketName` nos Outputs
+para obter os nomes efetivos; a ingestao e a limpeza usam essas referencias.
+Atualizar uma stack que ainda usa os nomes antigos substitui os buckets.
+Faca backup antes: nao ha migracao automatica dos dados para os novos buckets.
+
+Durante a criacao, `InitialIpeaIngestion` chama a Lambda de ingestao,
+baixa o historico da serie `BM_ERV` pela API oficial HTTPS do Ipeadata e
+grava a lista de observacoes em
+`ipeadata/BM_ERV/ingestion_month=AAAA-MM/run_id=<uuid>/data.json` no Bronze.
+Essa e a serie da pagina `https://ipeadata.gov.br/ExibeSerie.aspx?serid=31924`:
+taxa de cambio comercial de venda media, R$/US$, com **frequencia anual**.
+A coleta mensal nao cria observacoes mensais inexistentes na fonte.
+Comex Stat esta implementado, mas `EnableComex=false` por padrao devido a
+manutencao da API. Para habilitar, atualize a stack com `EnableComex=true`.
+`InitialComexIngestion` aguarda a carga Ipea e executa coleta e processamento
+Comex antes de liberar a stack. Uma falha Comex nao e ignorada nem substituida
+por dados ficticios: pode causar rollback e exclusao dos dados.
+
+Parametros adicionais:
+
+| Parametro | Padrao e finalidade |
+| --- | --- |
+| `ComexYears` | `25`, de 1 a 30 anos-calendario, incluindo o ultimo ano disponivel; nunca antes de 1997 |
+| `ComexNcmCodes` | `84271011,84272010,84271019,84279000,84312011,84312019`, filtros herdados da consulta 162584 no commit de referencia |
+| `InitialLoadRevision` | `3`; altere para repetir as cargas iniciais |
+| `ScheduleExpression` | `cron(0 6 1 * ? *)`; cron EventBridge em UTC |
+| `ScheduleState` | `ENABLED`; use `DISABLED` para suspender as coletas mensais |
+
+A coleta Comex consulta `/general/dates/updated` da API
+`https://api-comexstat.mdic.gov.br` para determinar o periodo disponivel e
+envia POST para `/general?language=pt`, sem usar o link temporario da pagina.
+O payload tem `flow=import`, `monthDetail=true`, filtro `ncm` com os codigos
+configurados, detalhamentos `ncm`, `country`, `state` e metricas `metricFOB`,
+`metricKG`, `metricStatistic`. A resposta fica em
+`comexstat/consulta=162584/flow=import/ingestion_month=AAAA-MM/run_id=<uuid>/data.json`.
+A API retornou HTTP 503 durante esta implementacao; o contrato de coleta foi
+exercitado offline, mas a consulta completa ainda precisa ser confirmada
+quando a fonte voltar. Reduza `ComexYears` se a resposta exceder 32 MiB;
+nao ha divisao automatica da consulta, truncamento silencioso ou carga parcial.
+
+A mesma Lambda inicia o Glue e aguarda o sucesso do job e a existencia de
+ao menos um arquivo `.parquet` nao vazio no prefixo de saida do Silver
+antes de liberar a criacao da stack. A verificacao percorre as paginas da
+listagem e nao depende de `_SUCCESS`, que o Glue pode nao gerar.
+Portanto, os dados
+iniciais estao nas duas camadas quando a stack atinge `CREATE_COMPLETE`;
+nao e necessario enviar arquivos manualmente. Falhas da API, de permissao
+ou do Glue/catalogo fazem essa etapa falhar explicitamente e podem causar rollback.
+O job Glue tem timeout de 10 minutos e a Lambda, de 15 minutos, incluindo
+download e espera na fila. Se esse prazo esgotar, a Lambda solicita a parada
+do job e registra falha, nao sucesso sem dados.
+
+A regra EventBridge executa por padrao no **dia 1 de cada mes, as 06:00 UTC**
+(03:00 em Brasilia). Coleta Ipea e, quando ativado, Comex com invocacoes
+independentes da mesma Lambda. Cada uma executa todo o caminho Bronze,
+Glue e Silver; a falha de uma nao impede a outra. O Glue processa uma
+execucao por vez e enfileira a outra. A espera na fila conta no timeout da
+Lambda. A entrega e a execucao assincrona possuem retries limitados; nao ha
+garantia de exactly-once. Uma reexecucao cria outro snapshot completo.
+Cada coleta baixa novamente o historico para incorporar novos valores e
+revisoes; snapshots anteriores, inclusive do mesmo mes, sao preservados.
+O Parquet fica em `<chave-original>.parquet/` no Silver.
+Os prefixos `ipeadata/`, `comexstat/` e `_metadata/` sao reservados: o
+`GlueStarterFunction` ignora esses eventos, pois o coletor controla o Glue.
+O output `IpeaIngestionFunctionName` identifica a funcao para acompanhar
+logs ou executar manualmente com `{"source":"ipeadata"}` ou
+`{"source":"comexstat"}` (Comex exige `EnableComex=true`).
+Em atualizacoes, altere `InitialLoadRevision` para repetir as cargas.
+Mudancas no script Glue tambem repetem as cargas, usando seu hash.
+
+### Integridade, qualidade e schemas Silver
+
+Cada snapshot tem um manifesto `_metadata/<chave-original>.manifest.json`
+no Bronze, escrito somente apos o objeto de dados, com status `COMPLETE`,
+SHA-256, bytes, registros, fonte, URL, filtros, horario e identificador da
+execucao. O coletor serializa o JSON recebido; decimais sao preservados como
+texto, sem conversao intermediaria para float. Nao e copia byte a byte da
+resposta HTTP. O Glue verifica hash, tamanho, contagem e identidade do
+snapshot antes de processa-lo. Historicos do formato antigo continuam no S3,
+mas nao sao entradas do novo fluxo sem manifesto.
+
+| Tabela | Colunas de negocio |
+| --- | --- |
+| `ipeadata` | `serie_codigo:string`, `data_referencia:date`, `ano:int`, `taxa_cambio:decimal(38,30)`, `nivel:string`, `territorio_codigo:string` |
+| `comexstat` | `fluxo:string`, `data_referencia:date`, `ano:int`, `mes:int`, `ncm_codigo:string`, `ncm_descricao:string`, `pais:string`, `uf_produto:string`, `valor_fob_usd:decimal(38,6)`, `quilograma_liquido:decimal(38,6)`, `quantidade_estatistica:decimal(38,6)` |
+
+Ambas incluem `bronze_key:string`, `bronze_run_id:string` e
+`data_ingestao:date`. NCM preserva oito digitos, inclusive zeros iniciais;
+datas e precisao numerica sao verificadas sem arredondamento silencioso.
+Campos opcionais Ipea podem ser nulos, inclusive cotacao explicitamente
+nula; cotacao ausente e invalida. Registros invalidos sao separados.
+Duplicatas identicas sao removidas; valores divergentes para a mesma chave
+de negocio rejeitam os registros conflitantes, em vez de escolher um valor
+arbitrario. A chave Ipea e serie/data/nivel/territorio; Comex usa
+fluxo/data/NCM/pais/UF.
+
+Os rejeitados ficam no Silver em `_rejected/<chave-original>` com motivo e
+registro. `_metadata/<chave-original>.report.json` contem aceitos,
+rejeitados, duplicatas removidas e estado de publicacao.
+Se nenhum registro valido restar, o job falha e preserva a tabela anterior.
+Se existirem validos, publica-os e registra os rejeitados no relatorio.
+O script escreve o snapshot antes de atualizar a tabela externa no database
+retornado por `SilverCatalogDatabase`; os dados anteriores nao sao
+sobrescritos. A tabela aponta para o ultimo snapshot publicado com sucesso,
+nao para todos os historicos. Athena pode consultar essas tabelas, mas seu
+workgroup, bucket de resultados e permissoes nao sao criados pelo template.
+
+O script Glue fica isolado no Artifacts, com nome baseado em SHA-256;
+`GlueScriptS3Uri` identifica o script efetivamente usado. Nao foi adicionado
+Step Functions: o fluxo permanece na Lambda, sem exigir trust ou permissoes
+de mais um servico na `LabRole`.
+
+Envie um arquivo CSV com cabecalho ou JSON (objeto ou lista de objetos) via
+POST ao `UploadApiEndpoint` retornado pela stack, usando
+`?filename=exemplo.csv` ou `?filename=exemplo.json`. O bucket Bronze tambem
+aceita uploads diretos via S3. Cada novo arquivo com extensao `.csv` ou
+`.json` dispara um job Glue: ele descarta linhas com campos nulos e linhas
+duplicadas e grava Parquet no Silver, em `<chave-original>.parquet/`.
+Arquivos de outros formatos permanecem apenas no Bronze. O bucket Gold fica
+disponivel para etapas analiticas futuras; esta stack nao o preenche.
+**Excluir a stack apaga permanentemente os quatro buckets e seus dados**,
+inclusive versoes e marcadores de exclusao. Isso tambem vale para rollback
+de criacao. Os buckets usam `DeletionPolicy: Delete` e
+`UpdateReplacePolicy: Delete`. Uma Lambda de limpeza esvazia os buckets e
+aborta uploads multipart pendentes antes da exclusao pelo CloudFormation.
+Pare uploads externos e aguarde os jobs Glue em andamento terminarem antes
+de excluir a stack, para evitar novas gravacoes durante a limpeza.
+A limpeza tem limite de 15 minutos; erros de permissao, Object Lock ou
+excesso de dados podem impedir a exclusao e exigem corrigir a causa e tentar
+novamente. A stack reutiliza exclusivamente a `LabRole` existente para
+as cinco Lambdas e o job Glue; nao cria nem altera roles ou politicas IAM e
+nao requer `CAPABILITY_IAM`. A identidade do deploy precisa de `iam:PassRole`
+para essa role, alem de permissoes para criar os recursos da stack.
+A `LabRole` precisa permitir que Lambda e Glue a assumam, gravar logs,
+ler/listar o Bronze, ler/listar/gravar/excluir objetos no Silver,
+gravar objetos no Bronze e executar `glue:StartJobRun` no job criado.
+A publicacao do script precisa de escrita/exclusao no Artifacts e o Glue,
+de leitura do script. O deploy precisa de `glue:CreateDatabase` e
+`glue:DeleteDatabase`; o job precisa de `glue:GetTable`, `glue:CreateTable`,
+`glue:UpdateTable` e, conforme as politicas do catalogo, `glue:GetDatabase`.
+Permissoes S3 abrangem tambem manifestos, rejeitados e relatorios.
+Essas acoes precisam ja estar autorizadas na `LabRole`; o template nao as concede.
+A ingestao tambem precisa de `glue:GetJobRun`, `glue:BatchStopJobRun` e
+`s3:ListBucket` no Silver para verificar o resultado. O deploy precisa criar
+as regras agendadas EventBridge e suas permissoes de invocacao Lambda.
+Para a limpeza, a role tambem precisa de `s3:ListBucket`,
+`s3:ListBucketVersions`, `s3:ListBucketMultipartUploads`, `s3:DeleteObject`,
+`s3:DeleteObjectVersion` e `s3:AbortMultipartUpload` nos buckets/objetos
+correspondentes. O CloudFormation precisa poder excluir os buckets.
+Se o laboratorio nao conceder essas permissoes ou relacoes de confianca,
+a troca no template nao as concede: solicite a adequacao ao responsavel
+pelo laboratorio. Cada execucao Glue tambem gera custos.
+
+Uma stack em `ROLLBACK_COMPLETE` precisa ser recriada, nao atualizada.
+Antes de tentar novamente, confira os buckets preservados pela tentativa
+anterior com a versao antiga do template, que usava nomes fixos por
+conta/regiao. Os novos nomes gerados nao reutilizam esses buckets.
+A limpeza nova nao remove buckets orfaos de stacks
+anteriores nem muda stacks que ainda usam o template antigo.
+Preserve os dados e planeje a importacao dos buckets ou nomes diferentes
+antes de recriar a stack; nao exclua buckets com dados para contornar o erro.
+
+Os contratos offline da ingestao podem ser executados sem acessar a AWS:
+`python -m unittest discover -s "IaC CloudFormation\tests" -p ipea_ingestion_test.py`.
+Schemas, qualidade e catalogacao:
+`python -m unittest discover -s "IaC CloudFormation\tests" -p silver_dataset_test.py`.
+
 O template `cloudformationCodeTracker.yaml` instala Docker nas VMs da
 aplicacao, MySQL principal na AZ2, MySQL de recuperacao na AZ1 e dois
 RabbitMQ independentes, um por AZ. A copia do banco a cada 12 horas e o
@@ -356,6 +539,89 @@ e execute `sudo docker stats` nas duas VMs backend via bastion, usando seus
 IPs privados. Observe consumo de memoria, reinicios e erros nos logs.
 Memoria e uso dos containers nao aparecem automaticamente nas metricas EC2
 desse painel; `docker stats` cobre essa verificacao manual.
+
+### Cobertura operacional e data lake
+
+O painel principal agora inclui creditos CPU das nove EC2 privadas.
+Os alarmes existentes de MySQL/RabbitMQ continuam ativos; um alarme adicional
+acompanha os status checks do manager, dos dois workers web e dos dois
+workers backend. Informe `BastionInstanceId` com o ID fisico de
+`BastionInstance` para habilitar o alarme do bastion.
+Tambem ha alertas para nenhum frontend saudavel no ALB (inclusive ausencia
+de telemetria por dois minutos) e latencia p95 acima de 2 segundos em
+3 de 5 minutos, ignorando percentis com poucas amostras.
+Os novos alarmes de EC2 e saude/latencia do ALB notificam a recuperacao por SNS.
+O painel de creditos CPU nao implica alarme de CPU ou de creditos baixos.
+
+Para monitorar o data lake, primeiro implante a versao atualizada de
+`buckets+lambda.yml`, que adiciona Outputs e metricas de ingestao.
+Atualize/crie `observabilidade-ti.yaml` na mesma conta e regiao, com um
+`EnvironmentName` que nao conflite com outro painel/topico existente.
+Copie os nomes fisicos dos Outputs do data lake para estes parametros:
+
+| Parametro da observabilidade | Output do data lake |
+| --- | --- |
+| `IpeaIngestionFunctionName` | `IpeaIngestionFunctionName` |
+| `UploadFunctionName` | `UploadFunctionName` |
+| `GlueStarterFunctionName` | `GlueStarterFunctionName` |
+| `ScriptPublisherFunctionName` | `ScriptPublisherFunctionName` |
+| `BucketCleanupFunctionName` | `BucketCleanupFunctionName` |
+| `GlueJobName` | `BronzeToSilverJobName` |
+| `BronzeBucketName` | `BronzeBucketName` |
+| `SilverBucketName` | `SilverBucketName` |
+| `GoldBucketName` | `GoldBucketName` |
+| `IpeaMonthlyRuleName` | `IpeaMonthlyRuleName` |
+
+Deixe todos esses parametros vazios para manter somente o monitoramento da
+aplicacao. Ao informar a Lambda Ipea, todos os nomes sao obrigatorios;
+o CloudFormation valida a configuracao antes de criar os recursos.
+Nao use o nome da stack ou ARN onde se pede nome fisico.
+
+O output `DataLakeDashboardUrl` abre o segundo painel, que mostra erros e
+throttles das cinco Lambdas, duracao da ingestao, resultados das cargas,
+quantidade de registros, tamanho diario dos tres buckets e entregas do
+agendamento mensal. A consulta Logs Insights exibe os resultados recentes;
+selecione um intervalo de pelo menos 35 dias para acompanhar a coleta mensal.
+O volume S3 e atualizado diariamente e nao confirma ingestao em tempo real;
+Gold vazio e esperado, pois nao existe transformacao Silver para Gold.
+
+A Lambda compartilhada Ipea/Comex emite Embedded Metric Format (EMF) no namespace
+`CodeTracker/DataLake`, dimensoes `FunctionName` e `FunctionName/Source`.
+Os alarmes existentes usam o total por funcao; o painel separa sucessos
+por fonte e a consulta de logs mostra `Source`. `IngestionSuccess=1` e
+`RecordsIngested` so sao registrados apos Glue `SUCCEEDED` e verificacao de
+Parquet nao vazio no Silver. `IngestionFailure=1` captura tambem falhas
+tratadas que retornam `FAILED` ao CloudFormation, sem incrementar o
+`AWS/Lambda Errors`. Exclusao do custom resource nao conta como ingestao.
+`RecordsIngested` conta registros coletados, nao somente aceitos; as
+contagens de qualidade ficam no relatorio de processamento do Silver.
+EMF usa os logs da Lambda e nao exige `cloudwatch:PutMetricData`, novas roles
+ou ampliacao de IAM; a `LabRole` ainda precisa permitir gravacao de logs.
+
+Os novos alertas do data lake notificam falha logica da ingestao, erros
+nativos e throttles nas Lambdas, HTTP 5xx da Function URL de upload,
+duracao Ipea superior a 12 minutos e falhas definitivas de entrega do
+agendamento. Eventos Glue `FAILED`, `TIMEOUT` e `STOPPED` do job configurado
+sao encaminhados diretamente pelo EventBridge ao SNS, incluindo o ID da
+execucao. A politica do topico autoriza apenas a regra criada nesta stack,
+sem criar roles IAM. O email ainda exige confirmacao da assinatura.
+Alertas nao sao retroativos: falhas anteriores a stack de observabilidade
+devem ser investigadas nos eventos CloudFormation e logs dos servicos.
+
+Limites importantes: EC2 status check nao verifica o processo MySQL,
+RabbitMQ ou a saude das replicas Swarm. Nao ha agente coletando memoria,
+disco livre, filas RabbitMQ, logs/journal das VMs ou idade do ultimo dump;
+falhas de backup/failover continuam no journal do standby.
+Nao existe alarme automatico de atraso mensal ou regra desativada:
+confira a ultima carga no painel e o agendamento. Ausencia de metricas
+esparsas das Lambdas entre coletas e normal e nao e tratada como falha.
+Falhas logicas tratadas do publisher/limpeza devem ser verificadas nos
+eventos CloudFormation, pois nao sao erros nativos de execucao Lambda.
+Metricas customizadas EMF, alarmes, dashboards e consultas Logs Insights
+podem gerar custos adicionais. A stack nao altera a retencao de logs.
+
+Contratos offline dos paineis:
+`python -m unittest discover -s "IaC CloudFormation\tests" -p observability_test.py`.
 
 ## 5. Encerrar o ambiente
 

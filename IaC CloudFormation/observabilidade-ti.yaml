@@ -41,9 +41,72 @@ Parameters:
     Type: String
     Default: ''
     Description: Email para alertas; vazio cria apenas o topico SNS.
+  BastionInstanceId:
+    Type: String
+    Default: ''
+    Description: ID do bastion; vazio desativa seu monitoramento.
+  IpeaIngestionFunctionName:
+    Type: String
+    Default: ''
+    Description: Nome fisico da Lambda compartilhada Ipea/Comex; preencha todos os nomes do data lake.
+  UploadFunctionName:
+    Type: String
+    Default: ''
+  GlueStarterFunctionName:
+    Type: String
+    Default: ''
+  ScriptPublisherFunctionName:
+    Type: String
+    Default: ''
+  BucketCleanupFunctionName:
+    Type: String
+    Default: ''
+  GlueJobName:
+    Type: String
+    Default: ''
+  BronzeBucketName:
+    Type: String
+    Default: ''
+  SilverBucketName:
+    Type: String
+    Default: ''
+  GoldBucketName:
+    Type: String
+    Default: ''
+  IpeaMonthlyRuleName:
+    Type: String
+    Default: ''
+
+Rules:
+  CompleteDataLakeConfiguration:
+    RuleCondition: !Not [!Equals [!Ref IpeaIngestionFunctionName, '']]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref UploadFunctionName, '']]
+          - !Not [!Equals [!Ref GlueStarterFunctionName, '']]
+          - !Not [!Equals [!Ref ScriptPublisherFunctionName, '']]
+          - !Not [!Equals [!Ref BucketCleanupFunctionName, '']]
+          - !Not [!Equals [!Ref GlueJobName, '']]
+          - !Not [!Equals [!Ref BronzeBucketName, '']]
+          - !Not [!Equals [!Ref SilverBucketName, '']]
+          - !Not [!Equals [!Ref GoldBucketName, '']]
+          - !Not [!Equals [!Ref IpeaMonthlyRuleName, '']]
+        AssertDescription: Preencha todos os nomes do data lake quando informar a Lambda Ipea.
 
 Conditions:
   HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasBastion: !Not [!Equals [!Ref BastionInstanceId, '']]
+  HasDataLake: !And
+    - !Not [!Equals [!Ref IpeaIngestionFunctionName, '']]
+    - !Not [!Equals [!Ref UploadFunctionName, '']]
+    - !Not [!Equals [!Ref GlueStarterFunctionName, '']]
+    - !Not [!Equals [!Ref ScriptPublisherFunctionName, '']]
+    - !Not [!Equals [!Ref BucketCleanupFunctionName, '']]
+    - !Not [!Equals [!Ref GlueJobName, '']]
+    - !Not [!Equals [!Ref BronzeBucketName, '']]
+    - !Not [!Equals [!Ref SilverBucketName, '']]
+    - !Not [!Equals [!Ref GoldBucketName, '']]
+    - !Not [!Equals [!Ref IpeaMonthlyRuleName, '']]
 
 Resources:
   OperationsTopic:
@@ -137,6 +200,23 @@ Resources:
                 "title": "Latencia dos targets (p95)", "region": "${AWS::Region}", "stat": "p95", "period": 60,
                 "metrics": [
                   ["AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroupFullName}", "LoadBalancer", "${LoadBalancerFullName}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 18, "width": 24, "height": 6,
+              "properties": {
+                "title": "Creditos CPU das EC2 (T3/T2; sem dados em outros tipos)", "region": "${AWS::Region}", "stat": "Minimum", "period": 300,
+                "metrics": [
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL AZ2"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${DatabaseStandbyInstanceId}", {"label": "MySQL AZ1"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend AZ1"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend AZ2"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ AZ1"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${RabbitMqInstanceAz2Id}", {"label": "RabbitMQ AZ2"}]
                 ]
               }
             }
@@ -249,6 +329,340 @@ Resources:
       TreatMissingData: notBreaching
       AlarmActions: [!Ref OperationsTopic]
 
+  ApplicationInstancesStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Falha de status em manager, web ou backend. Consulte o painel para identificar a EC2.
+      Metrics:
+        - Id: failures
+          Expression: MAX([manager,web1,web2,backend1,backend2])
+          ReturnData: true
+        - Id: manager
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/EC2, MetricName: StatusCheckFailed, Dimensions: [{Name: InstanceId, Value: !Ref SwarmManagerInstanceId}]}
+            Period: 60
+            Stat: Maximum
+        - Id: web1
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/EC2, MetricName: StatusCheckFailed, Dimensions: [{Name: InstanceId, Value: !Ref WebAz1InstanceId}]}
+            Period: 60
+            Stat: Maximum
+        - Id: web2
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/EC2, MetricName: StatusCheckFailed, Dimensions: [{Name: InstanceId, Value: !Ref WebAz2InstanceId}]}
+            Period: 60
+            Stat: Maximum
+        - Id: backend1
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/EC2, MetricName: StatusCheckFailed, Dimensions: [{Name: InstanceId, Value: !Ref BackendAz1InstanceId}]}
+            Period: 60
+            Stat: Maximum
+        - Id: backend2
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/EC2, MetricName: StatusCheckFailed, Dimensions: [{Name: InstanceId, Value: !Ref BackendAz2InstanceId}]}
+            Period: 60
+            Stat: Maximum
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref OperationsTopic]
+      OKActions: [!Ref OperationsTopic]
+
+  BastionStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasBastion
+    Properties:
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions: [{Name: InstanceId, Value: !Ref BastionInstanceId}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions: [!Ref OperationsTopic]
+      OKActions: [!Ref OperationsTopic]
+
+  NoHealthyTargetsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Nenhum frontend saudavel no ALB ou telemetria ausente.
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - {Name: TargetGroup, Value: !Ref TargetGroupFullName}
+        - {Name: LoadBalancer, Value: !Ref LoadBalancerFullName}
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OperationsTopic]
+      OKActions: [!Ref OperationsTopic]
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Latencia p95 acima de 2 segundos em 3 de 5 minutos.
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - {Name: TargetGroup, Value: !Ref TargetGroupFullName}
+        - {Name: LoadBalancer, Value: !Ref LoadBalancerFullName}
+      ExtendedStatistic: p95
+      EvaluateLowSampleCountPercentile: ignore
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 3
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+      OKActions: [!Ref OperationsTopic]
+
+  DataLakeDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: HasDataLake
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-datalake'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{
+              "title":"Erros Lambda (inclui timeout e excecoes)","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[
+                ["AWS/Lambda","Errors","FunctionName","${IpeaIngestionFunctionName}",{"label":"Ingestao Ipea/Comex"}],
+                ["AWS/Lambda","Errors","FunctionName","${UploadFunctionName}",{"label":"Upload"}],
+                ["AWS/Lambda","Errors","FunctionName","${GlueStarterFunctionName}",{"label":"Glue starter"}],
+                ["AWS/Lambda","Errors","FunctionName","${ScriptPublisherFunctionName}",{"label":"Publisher"}],
+                ["AWS/Lambda","Errors","FunctionName","${BucketCleanupFunctionName}",{"label":"Limpeza"}]
+              ]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{
+              "title":"Throttles Lambda","region":"${AWS::Region}","stat":"Sum","period":300,
+              "metrics":[
+                ["AWS/Lambda","Throttles","FunctionName","${IpeaIngestionFunctionName}"],
+                ["AWS/Lambda","Throttles","FunctionName","${UploadFunctionName}"],
+                ["AWS/Lambda","Throttles","FunctionName","${GlueStarterFunctionName}"],
+                ["AWS/Lambda","Throttles","FunctionName","${ScriptPublisherFunctionName}"],
+                ["AWS/Lambda","Throttles","FunctionName","${BucketCleanupFunctionName}"]
+              ]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{
+              "title":"Ipea/Comex: cargas confirmadas, falhas e registros coletados","region":"${AWS::Region}","stat":"Sum","period":86400,
+              "metrics":[
+                ["CodeTracker/DataLake","IngestionSuccess","FunctionName","${IpeaIngestionFunctionName}","Source","ipeadata",{"label":"Sucesso Ipea"}],
+                ["CodeTracker/DataLake","IngestionSuccess","FunctionName","${IpeaIngestionFunctionName}","Source","comexstat",{"label":"Sucesso Comex (quando ativado)"}],
+                ["CodeTracker/DataLake","IngestionFailure","FunctionName","${IpeaIngestionFunctionName}"],
+                ["CodeTracker/DataLake","RecordsIngested","FunctionName","${IpeaIngestionFunctionName}"]
+              ]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{
+              "title":"Duracao do coletor Ipea/Comex (ms; inclui Glue)","region":"${AWS::Region}","stat":"Maximum","period":300,
+              "metrics":[["AWS/Lambda","Duration","FunctionName","${IpeaIngestionFunctionName}"]]}},
+            {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{
+              "title":"Tamanho diario dos buckets (bytes; nao e tempo real)","region":"${AWS::Region}","stat":"Average","period":86400,
+              "metrics":[
+                ["AWS/S3","BucketSizeBytes","BucketName","${BronzeBucketName}","StorageType","StandardStorage"],
+                ["AWS/S3","BucketSizeBytes","BucketName","${SilverBucketName}","StorageType","StandardStorage"],
+                ["AWS/S3","BucketSizeBytes","BucketName","${GoldBucketName}","StorageType","StandardStorage"]
+              ]}},
+            {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{
+              "title":"Agendamento mensal: invocacoes e falhas de entrega","region":"${AWS::Region}","stat":"Sum","period":3600,
+              "metrics":[
+                ["AWS/Events","Invocations","RuleName","${IpeaMonthlyRuleName}"],
+                ["AWS/Events","FailedInvocations","RuleName","${IpeaMonthlyRuleName}"]
+              ]}},
+            {"type":"log","x":0,"y":18,"width":24,"height":6,"properties":{
+              "title":"Ultimas cargas por fonte (logs; depende da retencao)","region":"${AWS::Region}",
+              "query":"SOURCE '/aws/lambda/${IpeaIngestionFunctionName}' | fields @timestamp, Source, IngestionSuccess, IngestionFailure, RecordsIngested, @message | filter ispresent(IngestionSuccess) or ispresent(IngestionFailure) | sort @timestamp desc | limit 30"
+            }}
+          ]
+        }
+
+  IpeaLogicalFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDataLake
+    Properties:
+      AlarmDescription: Falha logica da ingestao, inclusive FAILED devolvido ao CloudFormation.
+      Namespace: CodeTracker/DataLake
+      MetricName: IngestionFailure
+      Dimensions: [{Name: FunctionName, Value: !Ref IpeaIngestionFunctionName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  DataLakeLambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDataLake
+    Properties:
+      AlarmDescription: Erro em uma das cinco Lambdas do data lake; consulte o painel e os logs.
+      Metrics:
+        - {Id: total, Expression: 'SUM([ipea,upload,starter,publisher,cleanup])', ReturnData: true}
+        - Id: ipea
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref IpeaIngestionFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: upload
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref UploadFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: starter
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref GlueStarterFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: publisher
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref ScriptPublisherFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: cleanup
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Errors, Dimensions: [{Name: FunctionName, Value: !Ref BucketCleanupFunctionName}]}
+            Period: 300
+            Stat: Sum
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  IpeaDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDataLake
+    Properties:
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions: [{Name: RuleName, Value: !Ref IpeaMonthlyRuleName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  IpeaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDataLake
+    Properties:
+      AlarmDescription: Ingestao levou mais de 12 minutos, proxima ao timeout de 15 minutos.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions: [{Name: FunctionName, Value: !Ref IpeaIngestionFunctionName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 720000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  DataLakeLambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDataLake
+    Properties:
+      AlarmDescription: Invocacao Lambda limitada por concorrencia; consulte o painel do data lake.
+      Metrics:
+        - {Id: total, Expression: 'SUM([ipea,upload,starter,publisher,cleanup])', ReturnData: true}
+        - Id: ipea
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Throttles, Dimensions: [{Name: FunctionName, Value: !Ref IpeaIngestionFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: upload
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Throttles, Dimensions: [{Name: FunctionName, Value: !Ref UploadFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: starter
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Throttles, Dimensions: [{Name: FunctionName, Value: !Ref GlueStarterFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: publisher
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Throttles, Dimensions: [{Name: FunctionName, Value: !Ref ScriptPublisherFunctionName}]}
+            Period: 300
+            Stat: Sum
+        - Id: cleanup
+          ReturnData: false
+          MetricStat:
+            Metric: {Namespace: AWS/Lambda, MetricName: Throttles, Dimensions: [{Name: FunctionName, Value: !Ref BucketCleanupFunctionName}]}
+            Period: 300
+            Stat: Sum
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  UploadHttp5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasDataLake
+    Properties:
+      AlarmDescription: Function URL retornou HTTP 5xx, mesmo sem excecao nao tratada na Lambda.
+      Namespace: AWS/Lambda
+      MetricName: Url5xxCount
+      Dimensions: [{Name: FunctionName, Value: !Ref UploadFunctionName}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OperationsTopic]
+
+  GlueFailureTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: HasDataLake
+    Properties:
+      Topics: [!Ref OperationsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref OperationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt GlueFailureRule.Arn
+
+  GlueFailureRule:
+    Type: AWS::Events::Rule
+    Condition: HasDataLake
+    Properties:
+      EventPattern:
+        source: [aws.glue]
+        detail-type: [Glue Job State Change]
+        detail:
+          jobName: [!Ref GlueJobName]
+          state: [FAILED, TIMEOUT, STOPPED]
+      Targets:
+        - {Arn: !Ref OperationsTopic, Id: NotifyOperations}
+
 Outputs:
   DashboardName:
     Value: !Ref OperationsDashboard
@@ -256,3 +670,6 @@ Outputs:
     Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OperationsDashboard}'
   AlertTopicArn:
     Value: !Ref OperationsTopic
+  DataLakeDashboardUrl:
+    Condition: HasDataLake
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${DataLakeDashboard}'
