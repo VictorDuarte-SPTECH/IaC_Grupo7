@@ -282,7 +282,10 @@ Parametros a preencher:
   distinta da senha do MySQL. O bootstrap aplica um hash BCrypt ao administrador
   importado e falha se o usuario ativo com `ROLE_ADMIN` nao existir.
 - `JwtSecret`: chave aleatoria codificada em Base64 que represente ao menos
-  32 bytes (256 bits), nao uma senha de usuario. Gere uma nova no PowerShell:
+  32 bytes (256 bits), nao uma senha de usuario nem um token JWT.
+  O comando PowerShell tambem aparece na descricao desse parametro na tela
+  de criacao da stack. Execute-o localmente e cole somente a chave gerada;
+  o console CloudFormation nao executa comandos. Gere uma nova no PowerShell:
 
   ```powershell
   $bytes = New-Object byte[] 32
