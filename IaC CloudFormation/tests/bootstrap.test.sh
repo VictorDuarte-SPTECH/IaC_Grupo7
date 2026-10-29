@@ -113,9 +113,17 @@ run_manager_case() {
         'sleep() { SLEEP_COUNT=$((SLEEP_COUNT + 1)); if [[ "$CASE_MODE" != workers-timeout ]]; then WORKERS_AVAILABLE=true; fi; }' \
         'docker() {' \
         '  case "$1 $2" in' \
-        '    "node ls") if [[ "$WORKERS_AVAILABLE" == true ]]; then printf "node-id Ready\n"; fi ;;' \
+        '    "node ls")' \
+        '      if [[ "$WORKERS_AVAILABLE" == true ]]; then' \
+        '        if [[ "$CASE_MODE" != backend-timeout || "$*" != *name=backend-* ]]; then printf "node-id Ready\n"; fi' \
+        '      fi ;;' \
         '    "node update") printf "NODE_UPDATED\n" >&2 ;;' \
-        '    "service ls") if [[ "$*" == *"{{.Name}} {{.Replicas}}"* ]]; then if [[ "$CASE_MODE" == backend-short ]]; then printf "codetracker_backend 2/4 (max 2 per node)\n"; else printf "codetracker_backend 4/4 (max 2 per node)\n"; fi; printf "codetracker_frontend 2/2 (max 1 per node)\ncodetracker_etiquetas 1/1\n"; else printf "SERVICE_LIST\n"; fi ;;' \
+        '    "service ls")' \
+        '      if [[ "$*" == *"{{.Name}} {{.Replicas}}"* ]]; then' \
+        '        if [[ "$CASE_MODE" == backend-short ]]; then printf "codetracker_backend 2/4 (max 2 per node)\n"; else printf "codetracker_backend 4/4 (max 2 per node)\n"; fi' \
+        '        printf "codetracker_frontend 2/2 (max 1 per node)\n"' \
+        '        if [[ "$CASE_MODE" == etiquetas-short ]]; then printf "codetracker_etiquetas 1/2 (max 1 per node)\n"; else printf "codetracker_etiquetas 2/2 (max 1 per node)\n"; fi' \
+        '      else printf "SERVICE_LIST\n"; fi ;;' \
         '    "run --rm") return 1 ;;' \
         '    "stack deploy") : ;;' \
         '    *) return 1 ;;' \
@@ -145,11 +153,11 @@ run_manager_case() {
       [[ "$output" != *SIGNAL=FAILURE* && "$output" == *NODE_UPDATED* ]]
       [[ "$output" == *'HTTP_CHECK=http://${ApplicationLoadBalancer.DNSName}/api/'* ]]
       ;;
-    workers-timeout)
+    workers-timeout|backend-timeout)
       [[ "$exit_status" != 0 && "$output" == *SIGNAL=FAILURE* ]]
-      [[ "$output" == *'quatro workers nao ficaram prontos'* && "$output" != *SIGNAL=SUCCESS* ]]
+      [[ "$output" == *'workers previstos nao ficaram prontos'* && "$output" != *SIGNAL=SUCCESS* ]]
       ;;
-    api-failure|backend-short)
+    api-failure|backend-short|etiquetas-short)
       [[ "$exit_status" != 0 && "$output" == *SIGNAL=FAILURE* ]]
       [[ "$output" != *SIGNAL=SUCCESS* ]]
       ;;
@@ -161,6 +169,153 @@ run_manager_case recovery
 run_manager_case workers-timeout
 run_manager_case api-failure
 run_manager_case backend-short
+run_manager_case etiquetas-short
+run_manager_case backend-timeout
+
+run_broker_case() {
+  local resource="$1" scenario="$2" broker_script output exit_status=0
+  broker_script=$(awk -v resource="$resource" '
+    { sub(/\r$/, "") }
+    $0 ~ "^  " resource ":" { selected = 1; next }
+    selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
+    selected && /^          BOOTSTRAP_STAGE=rabbitmq-start$/ { extracting = 1 }
+    extracting && /^          BOOTSTRAP_STAGE=swarm-worker-join$/ { exit }
+    extracting { sub(/^          /, ""); print }
+  ' "$template")
+  [[ -n "$broker_script" ]]
+  output=$(
+    {
+      printf '%s\n' \
+        'set -euo pipefail' \
+        'sleep() { :; }' \
+        'docker() {' \
+        '  case "$1 $2" in' \
+        '    "volume create") [[ "$3" == rabbitmq-data ]] ;;' \
+        '    "run --detach")' \
+        '      [[ "$*" == *"--memory 1g"* && "$*" == *"--publish 127.0.0.1:15672:15672"* && "$*" == *"--volume rabbitmq-data:/var/lib/rabbitmq"* ]] || return 1' \
+        '      printf "BROKER_STARTED\n" ;;' \
+        '    "inspect --format") if [[ "$CASE_MODE" == healthy ]]; then printf healthy; else printf unhealthy; fi ;;' \
+        '    *) return 1 ;;' \
+        '  esac' \
+        '}'
+      printf '%s\n' "$broker_script"
+    } | CASE_MODE="$scenario" bash 2>&1
+  ) || exit_status=$?
+  [[ "$output" == *BROKER_STARTED* ]]
+  if [[ "$scenario" == healthy ]]; then
+    [[ "$exit_status" == 0 ]]
+  else
+    [[ "$exit_status" != 0 && "$output" == *'nao ficou saudavel'* ]]
+  fi
+  printf 'PASS: broker %s %s\n' "$resource" "$scenario"
+}
+
+for resource in BackendInstanceAz1 BackendInstanceAz2; do
+  run_broker_case "$resource" healthy
+  run_broker_case "$resource" unhealthy
+done
+
+run_join_case() {
+  local resource="$1" scenario="$2"
+  local join_script output exit_status=0
+  join_script=$(awk -v resource="$resource" '
+    { sub(/\r$/, "") }
+    $0 ~ "^  " resource ":" { selected = 1; next }
+    selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
+    selected && /^          BOOTSTRAP_STAGE=swarm-worker-join$/ { extracting = 1 }
+    extracting && /^        - BootstrapScript:/ { exit }
+    extracting { sub(/^          /, ""); print }
+  ' "$template")
+  [[ -n "$join_script" ]]
+  output=$(
+    {
+      printf '%s\n' \
+        'set -euo pipefail' \
+        'JOINED=false' \
+        'REGION=us-east-1' \
+        'sleep() { :; }' \
+        'aws() {' \
+        '  case "$*" in' \
+        '    *swarm/stack-id*) if [[ "$CASE_MODE" == stale-stack ]]; then printf "other-stack"; else printf "%s" '\''${AWS::StackId}'\''; fi ;;' \
+        '    *swarm/manager-ip*) printf "10.0.0.68" ;;' \
+        '    *swarm/worker-token*) [[ "$*" == *--with-decryption* ]] || return 1; printf "test-worker-token" ;;' \
+        '    *) return 1 ;;' \
+        '  esac' \
+        '}' \
+        'docker() {' \
+        '  case "$1 $2" in' \
+        '    "info --format")' \
+        '      if [[ "$3" == "{{.Swarm.LocalNodeState}}" ]]; then' \
+        '        if [[ "$JOINED" == true ]]; then printf active; else printf inactive; fi' \
+        '      else return 1; fi ;;' \
+        '    "swarm join")' \
+        '      printf "JOIN_ATTEMPT\n"' \
+        '      [[ "$CASE_MODE" != join-failure && "$*" == *"--token test-worker-token 10.0.0.68:2377"* && "$*" != *--availability* ]] || return 1' \
+        '      JOINED=true ;;' \
+        '    *) return 1 ;;' \
+        '  esac' \
+        '}'
+      printf '%s\n' "$join_script"
+    } | CASE_MODE="$scenario" bash 2>&1
+  ) || exit_status=$?
+  if [[ "$scenario" == success ]]; then
+    [[ "$exit_status" == 0 && "$output" == *JOIN_ATTEMPT* ]]
+  else
+    [[ "$exit_status" != 0 && "$output" == *'Nao foi possivel adicionar'* ]]
+    if [[ "$scenario" == stale-stack ]]; then [[ "$output" != *JOIN_ATTEMPT* ]]; fi
+  fi
+  [[ "$output" != *test-worker-token* ]]
+  printf 'PASS: join %s %s\n' "$resource" "$scenario"
+}
+
+for scenario in success stale-stack join-failure; do
+  run_join_case BackendInstanceAz1 "$scenario"
+  run_join_case BackendInstanceAz2 "$scenario"
+done
+
+etiquetas_service=$(awk '
+  { sub(/\r$/, "") }
+  /^            etiquetas:$/ { extracting = 1 }
+  extracting && /^            frontend:$/ { exit }
+  extracting { print }
+' "$template")
+[[ "$etiquetas_service" == *'replicas: 2'* ]]
+[[ "$etiquetas_service" == *'constraints: [node.labels.tier == backend]'* ]]
+[[ "$etiquetas_service" == *'max_replicas_per_node: 1'* ]]
+for resource in BackendInstanceAz1 BackendInstanceAz2; do
+  instance=$(awk -v resource="$resource" '
+    $0 ~ "^  " resource ":" { selected = 1; next }
+    selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
+    selected { print }
+  ' "$template")
+  for ingress in SwarmManagementIngress SwarmDiscoveryTcpIngress SwarmDiscoveryUdpIngress SwarmOverlayIngress; do
+    [[ "$instance" == *"- $ingress"* ]]
+  done
+  [[ "$instance" == *'- !Ref SwarmSecurityGroup'* ]]
+  [[ "$instance" == *'- !Ref RabbitMqSecurityGroup'* ]]
+  [[ "$instance" != *'docker swarm init'* ]]
+  [[ "$instance" == *'--volume rabbitmq-data:/var/lib/rabbitmq'* ]]
+  [[ "$instance" == *'install_aws_cli'* ]]
+done
+printf 'PASS: RabbitMQ e etiquetas em cada worker backend\n'
+
+instance=$(awk '
+  /^  SwarmManagerInstance:/ { selected = 1; next }
+  selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
+  selected { print }
+' "$template")
+[[ "$instance" == *'SubnetId: !Ref WebSubnetAz1'* ]]
+[[ "$instance" == *'- WebSubnetAz1RouteTableAssociation'* ]]
+[[ "$instance" == *'- PrivateDefaultRouteAz1'* ]]
+[[ "$instance" == *'AssociatePublicIpAddress: false'* ]]
+[[ "$instance" == *'- !Ref PrivateSshSecurityGroup'* ]]
+[[ "$instance" == *'- !Ref SwarmSecurityGroup'* ]]
+[[ "$instance" != *'- !Ref WebSecurityGroup'* ]]
+[[ "$instance" == *'--availability drain'* ]]
+! grep -Eq 'SwarmManagerInstanceAz2|MANAGER_AZ2_ID|swarm/manager-token' "$template"
+! grep -Eq '^  RabbitMqInstance(Az2)?:|EnableRabbitMq' "$template"
+[[ $(grep -c 'Type: AWS::EC2::Instance' "$template") == 8 ]]
+printf 'PASS: manager unico e oito EC2, sem hosts RabbitMQ dedicados\n'
 
 backend_service=$(awk '
   { sub(/\r$/, "") }
@@ -178,10 +333,22 @@ for resource in BackendInstanceAz1 BackendInstanceAz2; do
     selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
     selected { print }
   ' "$template")
-  [[ "$instance" == *'InstanceType: !Ref InstanceType'* ]]
+  [[ "$instance" == *'InstanceType: !Ref BackendInstanceType'* ]]
 done
 grep -Fq 'Default: t3.small' "$template"
-printf 'PASS: quatro backends, dois por VM t3.small por padrao, com VIP\n'
+printf 'PASS: quatro backends, dois por VM t3.medium por padrao, com VIP\n'
+
+for parameter in InstanceType BackendInstanceType DatabaseInstanceType FrontendInstanceType; do
+  expected_type=t3.micro
+  if [[ "$parameter" == InstanceType ]]; then expected_type=t3.small; fi
+  if [[ "$parameter" == BackendInstanceType ]]; then expected_type=t3.medium; fi
+  definition=$(awk -v parameter="$parameter" '
+    $0 ~ "^  " parameter ":" { selected = 1; next }
+    selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
+    selected { print }
+  ' "$template")
+  [[ "$definition" == *"Default: $expected_type"* ]]
+done
 
 admin_setup=$(awk '
   { sub(/\r$/, "") }
@@ -223,7 +390,7 @@ for row_count in 1 0; do
 done
 printf 'PASS: senha do administrador com BCrypt e falha se usuario nao existir\n'
 
-for resource in BastionInstance SwarmManagerInstance BackendInstanceAz1 BackendInstanceAz2 RabbitMqInstance RabbitMqInstanceAz2 DatabaseInstance DatabaseStandbyInstance WebInstanceAz1 WebInstanceAz2; do
+for resource in BastionInstance SwarmManagerInstance BackendInstanceAz1 BackendInstanceAz2 DatabaseInstance DatabaseStandbyInstance WebInstanceAz1 WebInstanceAz2; do
   script=$(awk -v resource="$resource" '
     $0 ~ "^  " resource ":" { selected = 1; next }
     selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
@@ -242,16 +409,25 @@ for resource in BastionInstance SwarmManagerInstance BackendInstanceAz1 BackendI
   printf '%s\n' "$script" | bash -n
   [[ $(printf '%s' "$script" | wc -c) -lt 16384 ]]
   instance=$(awk -v resource="$resource" '
+    { sub(/\r$/, "") }
     $0 ~ "^  " resource ":" { selected = 1; next }
     selected && /^  [A-Za-z][A-Za-z0-9]*:/ { exit }
     selected { print }
   ' "$template")
   [[ "$instance" == *'IamInstanceProfile: !Ref InstanceProfileName'* ]]
   [[ "$instance" != *'BronzeLogsWritePolicy'* ]]
+  case "$resource" in
+    DatabaseInstance|DatabaseStandbyInstance) expected_parameter=DatabaseInstanceType ;;
+    WebInstanceAz1|WebInstanceAz2) expected_parameter=FrontendInstanceType ;;
+    BackendInstanceAz1|BackendInstanceAz2) expected_parameter=BackendInstanceType ;;
+    *) expected_parameter=InstanceType ;;
+  esac
+  [[ "$instance" == *"InstanceType: !Ref $expected_parameter"$'\n'* ]]
 done
-grep -Fq 'Count: 10' "$template"
+printf 'PASS: quatro t3.micro, dois t3.small e dois t3.medium\n'
+grep -Fq 'Count: 8' "$template"
 ! grep -Eiq 'fluent.?bit|BronzeLogs|AWS::S3::Bucket|s3:PutObject' "$template"
-printf 'PASS: dez scripts validos sem Fluent Bit nem acesso a buckets\n'
+printf 'PASS: oito scripts validos sem Fluent Bit nem acesso a buckets\n'
 grep -Fq 'systemctl start --no-block label-swarm-workers.service' "$template"
 alb_dependencies=$(awk '/^  ApplicationLoadBalancer:/ { extracting = 1; next } extracting && /^    Properties:/ { exit } extracting { print }' "$template")
 [[ "$alb_dependencies" == *InternetGatewayAttachment* && "$alb_dependencies" == *PublicDefaultRoute* ]]
@@ -269,4 +445,4 @@ grep -Fq 'OnCalendar=*-*-* 00,12:00:00 UTC' "$template"
 grep -Fq 'OnUnitInactiveSec=30s' "$template"
 grep -Fq 'SPRING_RABBITMQ_ADDRESSES:' "$template"
 grep -Fq "'/\${EnvironmentName}/database/standby-ready'" "$template"
-printf 'PASS: dez scripts compostos validos e abaixo de 16 KiB antes da substituicao de parametros\n'
+printf 'PASS: oito scripts compostos validos e abaixo de 16 KiB antes da substituicao de parametros\n'

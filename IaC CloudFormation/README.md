@@ -184,16 +184,64 @@ Schemas, qualidade e catalogacao:
 `python -m unittest discover -s "IaC CloudFormation\tests" -p silver_dataset_test.py`.
 
 O template `cloudformationCodeTracker.yaml` instala Docker nas VMs da
-aplicacao, MySQL principal na AZ2, MySQL de recuperacao na AZ1 e dois
-RabbitMQ independentes, um por AZ. A copia do banco a cada 12 horas e o
-failover para AZ1 sao automaticos. O manager descobre os quatro workers,
-aplica labels e executa `docker stack deploy`.
+aplicacao, MySQL principal na AZ2 e MySQL de recuperacao na AZ1. As EC2
+exclusivas do RabbitMQ foram removidas: cada worker backend executa seu broker local.
+A copia do banco a cada 12 horas e o
+failover para AZ1 sao automaticos. O unico manager, na AZ1, inicializa o
+cluster e fica em `Drain`. O manager AZ2 foi retirado para teste.
+O manager AZ1 descobre quatro workers, aplica
+labels e executa `docker stack deploy`.
+
+| Funcao | AZ1 | AZ2 |
+| --- | --- | --- |
+| Manager Swarm | 1, `Drain`, subnet web privada | 0 |
+| Worker web | 1 frontend | 1 frontend |
+| Worker backend (`t3.medium`) | 2 replicas backend + 1 etiquetas + 1 RabbitMQ | 2 replicas backend + 1 etiquetas + 1 RabbitMQ |
+| MySQL | 1 standby | 1 principal |
+| Bastion | 1 | 0 |
+
+Total padrao: **8 EC2, cinco nos Swarm (um manager e quatro workers)** e oito
+containers da aplicacao (dois frontend, quatro backend e dois etiquetas).
+Os dois brokers sao containers Docker locais adicionais, fora da stack Swarm,
+com volume nomeado `rabbitmq-data`; nao sao tarefas agendadas pelo Swarm.
+Cada backend tem quatro containers: dois backend, um etiquetas e um RabbitMQ.
+O total e dez containers, incluindo os dois brokers. Nao existem mais workers
+`tier=rabbitmq` nem parametro de ativacao das EC2 exclusivas.
+Ha duas AZs na mesma regiao AWS, nao duas regioes.
+
+O manager compartilha a subnet web privada AZ1 com o frontend, mas usa
+somente `PrivateSshSecurityGroup` e `SwarmSecurityGroup`, sem IP publico nem
+`WebSecurityGroup`. A comunicacao com os workers usa a rota local da VPC.
+
+| Subnet privada | CIDR | EC2 previstas | IPs livres previstos |
+| --- | --- | --- | --- |
+| Web AZ1 | `10.0.0.64/28` | Frontend e manager AZ1 | 9 |
+| Web AZ2 | `10.0.0.80/28` | Frontend | 10 |
+| Backend AZ1 | `10.0.0.96/28` | Backend/etiquetas/RabbitMQ e MySQL standby | 9 |
+| Backend AZ2 | `10.0.0.112/28` | Backend/etiquetas/RabbitMQ e MySQL principal | 9 |
+
+Cada `/28` tem 11 IPs utilizaveis apos as reservas AWS. Essa contagem considera
+somente as EC2 previstas; IPs individuais continuam atribuidos pela AWS.
+Mudar a subnet de uma EC2 existente exige substituicao. Nao aplique essa
+mudanca diretamente ao manager de um cluster em uso sem um plano de
+migracao e preservacao do estado Swarm; o bootstrap da AZ1 inicializa um cluster.
+
+**O manager AZ1 e um ponto unico de falha do controle.** Perde-lo impede
+alteracoes e novos agendamentos, embora tarefas existentes possam continuar
+executando. Nao ha standby de manager nesta configuracao de teste.
+Para tolerar a perda de um manager, use tres; para tolerar a perda de qualquer
+AZ, distribua os tres em tres AZs. O lider e eleito pelo Swarm.
+Se um cluster existente ja tiver dois managers, nao exclua simplesmente a
+EC2 AZ2: a mudanca de participacao precisa ser feita com quorum disponivel,
+demovendo o manager a retirar antes de remove-lo. A remocao do recurso no
+CloudFormation nao executa essa democao. Para o teste, prefira uma stack nova
+e preserve os dados antes de substituir qualquer ambiente existente.
 
 ## 0. Preparar o ambiente
 
 Este roteiro sobe a infraestrutura AWS pelo console do CloudFormation.
 Nao e necessario executar os projetos Terraform, LocalStack ou o Compose
-local para este deploy. O template principal cria a rede, dez EC2, dois NAT
+local para este deploy. O template principal cria a rede, oito EC2 por padrao, dois NAT
 Gateways, ALB, dois volumes de banco, DNS privado e o cluster Swarm.
 O painel e os alertas sao uma segunda stack opcional, descrita no passo 4.
 
@@ -210,45 +258,68 @@ O painel e os alertas sao uma segunda stack opcional, descrita no passo 4.
    `codetracker-etiquetas`.
 4. Entre no console AWS e selecione uma regiao com pelo menos duas AZs.
    Em laboratorios, inicie a sessao do laboratorio antes de abrir o console.
-   Confira cotas e permissoes para dez EC2 `t3.small`, dois NAT Gateways,
+   Confira cotas e permissoes para oito EC2: quatro `t3.micro` (dois bancos e
+   dois frontends), duas `t3.small` (bastion e manager) e duas `t3.medium`
+   (backends compartilhados com etiquetas e RabbitMQ), dois NAT Gateways,
    tres Elastic IPs, ALB, VPC, EBS, SSM, Route 53 e CloudFormation.
 5. Em EC2 > Key pairs, crie ou selecione um par de chaves na mesma regiao.
    Guarde o arquivo privado `.pem`: ele sera usado no acesso pelo bastion.
 6. Confira o instance profile que sera associado as VMs, como
    `LabInstanceProfile`, e as permissoes descritas no passo 2. O template
    nao cria esse perfil.
-7. Separe senhas distintas para banco, RabbitMQ e administrador, alem da
-   chave JWT Base64. O exemplo de geracao da chave no passo 2 usa PowerShell,
+7. Separe senhas distintas para banco, administrador, RabbitMQ e SMTP, alem da
+   chave JWT Base64. Informe a conta SMTP e o destinatario das etiquetas.
+   O exemplo de geracao da chave no passo 2 usa PowerShell,
    sem instalar dependencias.
    Nao salve esses valores no repositorio.
 
 **Atencao:** os recursos geram custos enquanto existirem, inclusive sem
-acessos. As VMs backend continuam `t3.small` para o teste de carga, com duas
-replicas por VM; essa configuracao nao garante memoria suficiente sob carga.
+acessos. As VMs backend usam `t3.medium` (4 GiB) e compartilham recursos com
+etiquetas e RabbitMQ; confirme capacidade com teste de carga e metricas.
 Use dados de laboratorio: o template usa HTTP, importa dados de demonstracao
 e inclui segredos no UserData, conforme as limitacoes ao final.
 
-## 1. Publicar as imagens corrigidas
+## 1. Conferir as imagens publicadas
 
 Abra o terminal Bash no diretorio que contem as pastas dos repositorios.
 Com Docker em execucao, execute:
 
 ```bash
-bash IaC_Grupo7/publicar-dockerhub.sh guilhermebarros297 v1.0.1
+bash IaC_Grupo7/publicar-dockerhub.sh guilhermebarros297 <nova-tag>
 ```
 
-Os tres repositorios no Docker Hub precisam ser publicos. A imagem anterior
-do frontend usa `localhost:8080`; a nova usa `/api` em producao. Nao reutilize
-uma tag antiga para a versao corrigida. A arquitetura esperada e Linux amd64.
+O template usa por padrao as imagens ja publicadas como `v1.0.1` no namespace
+`guilhermebarros297` (backend, etiquetas e frontend). Confira as tres tags no
+Docker Hub antes do deploy. Elas precisam ser publicas e Linux amd64. O
+frontend usa `/api` em producao, nao `localhost:8080`.
 
-O script solicita login no Docker Hub, constroi backend, etiquetas e frontend,
-e publica as tres imagens. Substitua `guilhermebarros297` pelo seu namespace.
-Se a tag `v1.0.1` ja foi usada, escolha uma nova e use a mesma no CloudFormation.
-Antes de continuar, confirme no Docker Hub que a tag escolhida existe nos
-tres repositorios e que todos estao publicos. Nao publique senhas ou a chave
-JWT nas imagens: elas serao informadas na criacao da stack.
+Para publicar outra versao, use o comando acima com uma tag nova e configure
+`ApplicationImageTag` com essa mesma tag. O script solicita login no Docker
+Hub, constroi e publica as tres imagens. Nao inclua senhas ou a chave JWT nas
+imagens: elas sao fornecidas na criacao da stack.
 
 ## 2. Criar uma stack nova
+
+Esta versao altera a topologia e foi preparada para uma stack nova. Atualizar
+somente o template de uma stack existente nao garante instalar a AWS CLI,
+instalar os brokers nos backends, configurar o manager unico ou atualizar as
+replicas. Nao execute uma atualizacao em uso presumindo que o UserData sera
+reexecutado. Planeje migracao e backup do banco, das filas e dos volumes
+antes de substituir o ambiente; nao exclua a stack com dados a preservar.
+Se os ambientes coexistirem, use outro `EnvironmentName` para evitar colisao
+dos parametros SSM. Nenhuma migracao automatica de mensagens foi adicionada.
+
+**RabbitMQ consolidado nos backends:** `EnableRabbitMq` nao existe mais.
+`RabbitMqPassword` volta a ser obrigatorio, com ao menos 12 caracteres.
+Os Outputs RabbitMQ foram preservados, mas agora apontam para os IPs dos
+backends AZ1/AZ2 e seus tuneis SSH, nao para EC2 dedicadas.
+Antes de excluir as EC2 RabbitMQ antigas, interrompa produtores e consumidores
+e preserve mensagens, definicoes e dados dos volumes locais conforme a estrategia
+de migracao escolhida. Exportar definicoes nao exporta as mensagens das filas.
+Nao ha transferencia automatica do volume `rabbitmq-data` entre os hosts.
+Excluir a EC2 pode apagar permanentemente seus dados; nao apague antes de
+confirmar a preservacao necessaria. Mudar UserData ou o tipo da EC2 nao garante
+instalar o broker nos backends existentes: planeje a migracao ou use stack nova.
 
 1. Na regiao escolhida, abra CloudFormation > Stacks > Create stack >
    With new resources (standard).
@@ -257,8 +328,10 @@ JWT nas imagens: elas serao informadas na criacao da stack.
    `observabilidade-ti.yaml` nesta etapa.
 3. Avance e informe um nome de stack, por exemplo `lamar-app-teste`.
    O nome da stack e diferente de `EnvironmentName`, que prefixa os recursos.
-4. Preencha os parametros abaixo. Mantenha `InstanceType=t3.small` para
-   testar a carga com o tamanho atual.
+4. Preencha os parametros abaixo. Mantenha `InstanceType=t3.small`,
+   `BackendInstanceType=t3.medium`,
+   `DatabaseInstanceType=t3.micro` e `FrontendInstanceType=t3.micro` para
+   usar o dimensionamento atual.
 5. Em Configure stack options, mantenha o rollback automatico e as demais
    opcoes padrao, salvo exigencias do seu ambiente. Se usar uma service role
    do CloudFormation, ela precisa ter permissao para criar os recursos e
@@ -270,14 +343,16 @@ Parametros a preencher:
 - `EnvironmentName`: `lamar-auto-pecas`, ou outro prefixo exclusivo para
   esta implantacao, com ate 25 caracteres, letras, numeros e hifens.
 - `DockerHubNamespace`: `guilhermebarros297`.
-- `ApplicationImageTag`: `v1.0.1`, depois de publicar as tres imagens.
+- `ApplicationImageTag`: `v1.0.1` para as tres imagens publicadas.
 - `KeyName`: um par de chaves EC2 existente na regiao.
 - `InstanceProfileName`: um perfil IAM existente, por exemplo `LabInstanceProfile`.
 - `UbuntuAmiId`: mantenha o parametro SSM padrao do Ubuntu 24.04 amd64,
   desde que disponivel na regiao.
 - `DatabaseName`, `DatabaseUser` e `RabbitMqUser`: mantenha `lamar` para
   este roteiro; `DatabaseName` obrigatoriamente deve ser `lamar`.
-- `DatabasePassword` e `RabbitMqPassword`: senhas distintas com pelo menos 12 caracteres.
+- `DatabasePassword`: senha com pelo menos 12 caracteres.
+- `RabbitMqPassword`: obrigatoria para os dois brokers; use senha
+  distinta da senha do banco, com pelo menos 12 caracteres.
 - `AdminPassword`: senha inicial de 12 a 72 caracteres para `admin@teste.com`,
   distinta da senha do MySQL. O bootstrap aplica um hash BCrypt ao administrador
   importado e falha se o usuario ativo com `ROLE_ADMIN` nao existir.
@@ -301,12 +376,31 @@ Parametros a preencher:
   Copie a chave exibida para o parametro `JwtSecret` no CloudFormation.
   O comando usa aleatoriedade criptografica e funciona no Windows PowerShell
   5.1 e no PowerShell 7.
-- `InstanceType`: `t3.small` por padrao em todas as VMs, inclusive as backend.
-  Monitore memoria e CPU no teste de carga: duas replicas Java (limite de
-  768 MiB cada) e etiquetas (512 MiB) dividem a mesma VM com o sistema
-  operacional. Os limites somados ficam proximos dos 2 GiB da instancia,
-  sem folga para o sistema; sob carga pode haver falta de memoria. Mais
-  containers na mesma VM nao aumentam a capacidade de CPU da instancia.
+- `MailUsername`: conta de e-mail SMTP que envia e-mails do backend e etiquetas.
+- `MailPassword`: senha SMTP dessa conta (senha de app no Gmail); a senha
+  antiga presente em imagens anteriores deve ser revogada.
+- `EtiquetaEmailDestinatario`: e-mail que recebera as etiquetas geradas.
+- `InstanceType`: `t3.small` por padrao, somente manager e bastion.
+- `BackendInstanceType`: `t3.medium` por padrao, nos dois workers backend.
+  Cada VM tem 4 GiB de RAM e duas vCPUs. Hospeda duas replicas Java de 768 MiB,
+  um etiquetas de 512 MiB e um RabbitMQ com limite de 1 GiB. Os limites somam
+  3 GiB, deixando aproximadamente 1 GiB para SO e Docker; valide sob carga.
+  O watermark de memoria do RabbitMQ e 512 MiB, abaixo do limite do container.
+  Pressao de memoria pode bloquear produtores; nao e garantia contra OOM ou
+  falta de disco. Mais containers nao aumentam a capacidade de CPU da instancia.
+- `DatabaseInstanceType`: `t3.micro` por padrao, para MySQL principal e standby.
+  Cada instancia tem 1 GiB de RAM. Valide o consumo do MySQL, consultas e
+  restauracoes; pouca memoria pode causar OOM e indisponibilidade. Os volumes
+  de dados continuam gp3 de 20 GiB; reduzir a EC2 nao reduz esses volumes.
+- `FrontendInstanceType`: `t3.micro` por padrao, somente para `WebInstanceAz1`
+  e `WebInstanceAz2`. O manager na subnet web AZ1 continua usando
+  `InstanceType`; o limite de memoria de cada container frontend e 128 MiB.
+
+Nos defaults, sao quatro `t3.micro`, duas `t3.small` e duas `t3.medium`.
+Todos esses tipos possuem duas vCPUs: o total permanece 8 EC2 e 16 vCPUs.
+Os brokers nao exigem IPs VPC nem EC2 adicionais; o manager AZ2 continua ausente.
+Isso nao comprova a causa de `NotStabilized` nem garante atender aos limites
+do laboratorio; considere tambem instancias de outras stacks e regioes.
 
 Use uma regiao com ao menos duas zonas de disponibilidade e acesso ao parametro
 SSM da AMI Ubuntu. O perfil das VMs precisa permitir `ssm:PutParameter` e
@@ -314,6 +408,9 @@ SSM da AMI Ubuntu. O perfil das VMs precisa permitir `ssm:PutParameter` e
 SecureString com a chave usada pelo SSM e `cloudformation:SignalResource` na
 stack. Tambem sao necessarias `ssm:PutParameter` e `ssm:GetParameter` em
 `/<EnvironmentName>/database/ready` e `/<EnvironmentName>/database/standby-ready`.
+Os workers backend consultam SSM e descriptografam o token de worker.
+Esta versao nao publica token de ingresso de manager. Restrinja o acesso ao
+token de worker e nao o publique em logs.
 Para instalar e operar a recuperacao automatica, esse perfil tambem precisa:
 
 | Permissao | Escopo necessario |
@@ -338,7 +435,7 @@ do manager tem prazo de ate 60 minutos a partir da criacao de cada recurso.
 Uma EC2 em estado `running` nao significa que a aplicacao esta pronta.
 
 O processo e automatico: instala Docker, forma o Swarm, prepara MySQL e
-RabbitMQ, importa o banco e publica os servicos. Nao execute `docker compose up`
+RabbitMQ nos backends, importa o banco e publica os servicos. Nao execute `docker compose up`
 nem `docker swarm init` manualmente nas VMs.
 
 Se houver `CREATE_FAILED` ou `ROLLBACK_IN_PROGRESS`, localize na aba Events
@@ -348,11 +445,15 @@ Se houver dados a preservar, faca backup antes de excluir qualquer stack.
 
 ### O que acontece durante o bootstrap
 
-O manager publica `/<EnvironmentName>/swarm/stack-id` somente depois do IP e
-do token. Os workers so usam esses parametros quando o marcador corresponde
+O manager AZ1 publica `/<EnvironmentName>/swarm/stack-id` somente depois do IP,
+do token de worker e da criacao dos secrets. Os workers so usam
+esses parametros quando o marcador corresponde
 ao ID da stack atual, evitando entrada em um cluster de uma implantacao antiga.
 Nao execute stacks simultaneas com o mesmo `EnvironmentName` na mesma regiao.
-Os dez bootstraps usam a mesma rotina definida em `Mappings.Bootstrap`:
+Cada backend inicia seu RabbitMQ e aguarda saude antes de entrar como worker.
+Falhas do broker sinalizam a etapa `rabbitmq-start`. Sao esperados quatro
+workers e etiquetas usa `tier=backend`, uma replica em cada backend.
+Os oito bootstraps usam `Mappings.Bootstrap`:
 
 - Atualizacao completa dos indices APT por IPv4, com timeout de ate 60 segundos
   por tentativa e janela total de 600 segundos. Tentativas ficam separadas por
@@ -371,10 +472,12 @@ Os dez bootstraps usam a mesma rotina definida em `Mappings.Bootstrap`:
   por uma URL S3 pre-assinada, sem depender da instalacao da AWS CLI ou de
   permissoes IAM adicionais para esse sinal. A URL e sensivel: nao a publique.
 
-O `BootstrapWaitCondition` exige dez sinais unicos em ate 3600 segundos.
+O `BootstrapWaitCondition` exige oito sinais unicos em ate 3600 segundos.
 Uma falha identifica o recurso logico e a etapa, por exemplo
 `WebInstanceAz1: apt-update-exhausted`; o motivo detalhado do APT fica no log.
-Isso inclui bastion, os dois bancos e os dois RabbitMQ. A AZ1 so sinaliza
+Isso inclui bastion, manager AZ1, dois workers web, dois backends com RabbitMQ
+e os dois bancos. Nao ha sinal de EC2 RabbitMQ separada.
+O banco AZ1 so sinaliza
 sucesso depois de receber e restaurar o primeiro dump do principal.
 O sucesso do bootstrap do manager nao substitui o teste da aplicacao.
 
@@ -391,8 +494,8 @@ O bootstrap do manager sinaliza a `WaitCondition` assim que termina a
 configuracao inicial e inicia o verificador do Swarm em segundo plano. A
 `CreationPolicy` do `SwarmManagerInstance` continua pendente ate o manager
 verificar os workers, as replicas e as respostas HTTP da aplicacao. O manager
-aguarda ate 10 minutos pelos quatro workers antes de sinalizar falha; um worker
-ainda iniciando nao derruba a stack. Depois, aguarda ate 15 minutos pelo banco
+aguarda ate 10 minutos pelos quatro workers antes de sinalizar falha.
+Depois, aguarda ate 15 minutos pelo banco
 e pela primeira copia na AZ1, e 15 minutos pelas replicas e respostas HTTP.
 Falhas definitivas sao sinalizadas
 ao CloudFormation, em vez de aguardar o timeout. O prazo do manager e de ate
@@ -425,13 +528,20 @@ Depois de `CREATE_COMPLETE`, abra o output `ApplicationUrl`:
 sudo docker node ls
 sudo docker service ls
 sudo docker service ps codetracker_backend --filter desired-state=running
+sudo docker service ps codetracker_etiquetas --filter desired-state=running
 sudo docker service inspect codetracker_backend --format '{{.Spec.EndpointSpec.Mode}}'
 ```
 
-Devem aparecer cinco nos no Swarm: um manager em `Drain` e quatro workers
+Devem aparecer cinco nos no Swarm: um manager AZ1 em `Ready`/`Drain`
+e `Leader`, e quatro workers
 em `Ready`/`Active`. Os servicos devem mostrar backend `4/4`, frontend `2/2`
-e etiquetas `1/1`. Na lista de tarefas do backend, confira duas em
+e etiquetas `2/2`. Na lista de tarefas do backend, confira duas em
 `backend-az1` e duas em `backend-az2`; o modo de endpoint deve ser `vip`.
+Etiquetas deve ter uma tarefa em `backend-az1` e outra em `backend-az2`.
+Em cada backend, `sudo docker ps` tambem deve mostrar o broker local saudavel;
+ele nao aparece em `docker service ls`, pois esta fora da stack Swarm.
+O limite de uma replica por no impede concentrar ambas no host sobrevivente;
+se um host ficar indisponivel, uma replica pode ficar pendente.
 Se isso nao ocorrer, consulte os logs antes de iniciar o teste de carga.
 
 O fluxo de acesso fica assim:
@@ -439,28 +549,32 @@ O fluxo de acesso fica assim:
 ```text
 Navegador -> ALB :80 -> frontend/Nginx nas VMs web
                      -> /api/ -> VIP do backend -> 4 replicas :8080 na rede overlay
-                     -> /etiquetas-api/ -> etiquetas :8081 na rede overlay
+                     -> /etiquetas-api/ -> 2 etiquetas :8081 nas VMs backend, via overlay
 Backend -> database.<EnvironmentName>.internal:3306 -> MySQL AZ2
                                                        -> AZ1 apos failover
 MySQL AZ2 -> dump automatico a cada 12h -> MySQL AZ1 (somente leitura)
-Backend -> RabbitMQ AZ1 ou AZ2 (brokers independentes, sem replicacao)
+Backend -> IP privado do backend AZ1 ou AZ2 :5672 -> RabbitMQ local (brokers independentes)
 Etiquetas -> backend :8080 na rede overlay
 ```
 
 Ha duas replicas de frontend, uma por VM web, quatro de backend, duas por VM
-backend, e uma de etiquetas em uma VM backend. O Nginx do frontend encaminha
+backend, duas de etiquetas e dois brokers locais, um de cada por VM backend. O Nginx do frontend encaminha
 cada requisicao `/api/` ao VIP do servico backend; o Swarm distribui as
 conexoes entre as quatro replicas por round-robin (nao e afinidade por usuario).
 O ALB distribui as conexoes externas entre os dois frontends. O manager fica
 em modo drain.
-Somente a porta do frontend e publicada; backend e etiquetas sao internos.
+Na stack Swarm, somente a porta do frontend e publicada; backend e etiquetas
+sao internos. Os brokers locais publicam AMQP em 5672, restrito ao Security Group
+backend, e administracao somente em `127.0.0.1:15672`, via tunel SSH.
 O acesso MySQL fica restrito aos backends e a comunicacao entre os bancos
 necessaria ao dump. Os dois RabbitMQ ficam acessiveis pelos backends.
-`SPRING_RABBITMQ_ADDRESSES` recebe os dois enderecos, mas o codigo atual do
-backend nao possui integracao AMQP: a lista so tera efeito quando a aplicacao
-usar Spring AMQP. Os brokers nao formam cluster; filas, mensagens, usuarios
-adicionais e definicoes criados em um nao sao copiados para o outro.
-Conectar ao segundo broker nao recupera as mensagens do primeiro.
+Backend (producer) e etiquetas (consumer) recebem os dois IPs em
+`SPRING_RABBITMQ_ADDRESSES` e usam Spring AMQP. Os brokers nao formam cluster:
+filas, mensagens e definicoes de um nao sao copiadas para o outro. Se o
+producer publicar em um broker e o consumer estiver conectado apenas ao outro,
+a mensagem aguardara no primeiro. Conectar ao segundo broker nao recupera as
+mensagens do primeiro; planeje uma topologia compartilhada antes de depender
+de failover entre os brokers.
 
 ### Recuperacao automatica do MySQL
 
@@ -518,13 +632,15 @@ Na aba Resources da stack principal, obtenha os IDs fisicos e preencha:
 | `DatabaseVolumeId` | `DatabaseDataVolume` |
 | `DatabaseStandbyInstanceId` | `DatabaseStandbyInstance` |
 | `DatabaseStandbyVolumeId` | `DatabaseStandbyDataVolume` |
-| `RabbitMqInstanceId` | `RabbitMqInstance` |
-| `RabbitMqInstanceAz2Id` | `RabbitMqInstanceAz2` |
 | `SwarmManagerInstanceId` | `SwarmManagerInstance` |
 | `WebAz1InstanceId` | `WebInstanceAz1` |
 | `WebAz2InstanceId` | `WebInstanceAz2` |
 | `BackendAz1InstanceId` | `BackendInstanceAz1` |
 | `BackendAz2InstanceId` | `BackendInstanceAz2` |
+
+Nao existem parametros de IDs RabbitMQ nesta versao. Seus hosts sao os mesmos
+`BackendAz1InstanceId` e `BackendAz2InstanceId`; o painel os identifica como
+backend + etiquetas + RabbitMQ, sem duplicar metricas ou alarmes EC2.
 
 Para `LoadBalancerFullName`, copie do ARN de `ApplicationLoadBalancer`
 somente a parte apos `loadbalancer/`, no formato `app/nome/id`.
@@ -537,7 +653,7 @@ link enviado pelo SNS. Vazio, o parametro cria apenas o topico, sem destinatario
 de email. aguarde `CREATE_COMPLETE` e abra `DashboardUrl` na aba Outputs dessa stack.
 As metricas podem demorar alguns minutos para aparecer.
 
-Durante o teste com `t3.small`, acompanhe CPU e creditos de CPU no EC2/CloudWatch
+Durante o teste com `t3.medium`, acompanhe CPU e creditos de CPU no EC2/CloudWatch
 e execute `sudo docker stats` nas duas VMs backend via bastion, usando seus
 IPs privados. Observe consumo de memoria, reinicios e erros nos logs.
 Memoria e uso dos containers nao aparecem automaticamente nas metricas EC2
@@ -545,11 +661,14 @@ desse painel; `docker stats` cobre essa verificacao manual.
 
 ### Cobertura operacional e data lake
 
-O painel principal agora inclui creditos CPU das nove EC2 privadas.
-Os alarmes existentes de MySQL/RabbitMQ continuam ativos; um alarme adicional
-acompanha os status checks do manager, dos dois workers web e dos dois
+O painel principal inclui creditos CPU das sete EC2 privadas.
+Os alarmes MySQL continuam ativos. O status das EC2 compartilhadas com RabbitMQ
+e coberto pelos alarmes de backend, nao pelo estado dos processos. Um alarme adicional
+acompanha os status checks do manager AZ1, dos dois workers web e dos dois
 workers backend. Informe `BastionInstanceId` com o ID fisico de
 `BastionInstance` para habilitar o alarme do bastion.
+Nao e necessario informar ID de manager AZ2 nesta versao da observabilidade.
+Status checks EC2 nao comprovam quorum nem saude do servico Docker.
 Tambem ha alertas para nenhum frontend saudavel no ALB (inclusive ausencia
 de telemetria por dois minutos) e latencia p95 acima de 2 segundos em
 3 de 5 minutos, ignorando percentis com poucas amostras.
@@ -652,7 +771,8 @@ Contratos offline dos paineis:
    `/<EnvironmentName>/database/standby-ready` nao sao
    recursos gerenciados pelo template. Depois de confirmar que nenhuma
    stack usa esse prefixo, remova somente esses parametros no Parameter Store,
-   incluindo o token de entrada no Swarm.
+   incluindo o token de worker e eventual token de manager residual de versoes
+   anteriores, somente se nenhum ambiente ainda utilizar esses parametros.
 
 ## Dados e credenciais
 
@@ -669,7 +789,10 @@ esse hash por um BCrypt da senha informada em `AdminPassword`. Entre pelo
 nem `JwtSecret`. A mudanca de parametros em uma stack existente nao redefine
 a senha na VM ja inicializada: o UserData roda apenas na criacao da instancia.
 Revise/remova os dados de demonstracao e troque as credenciais antes de expor
-a aplicacao para uso real. SMTP nao e configurado neste deploy.
+a aplicacao para uso real. O backend e etiquetas recebem a mesma conta SMTP
+por `MAIL_USERNAME` e pelo secret `MAIL_PASSWORD`; etiquetas recebe ainda
+`ETIQUETA_EMAIL_DESTINATARIO`, o banco MySQL e os brokers RabbitMQ.
+O registro `solicitacao_etiqueta` e criado no banco pelo Hibernate (`update`).
 
 A importacao so ocorre em banco sem tabelas. O commit importado fica registrado
 em `/var/lib/mysql/.lamar-import-complete`, no EBS. Um banco com tabelas e sem
@@ -702,6 +825,7 @@ Use o output `SwarmManagerSshCommand` para acessar o manager pelo bastion:
 sudo docker node ls
 sudo docker service ls
 sudo docker service ps codetracker_backend --no-trunc
+sudo docker service ps codetracker_etiquetas --no-trunc
 sudo docker service logs codetracker_backend --tail 100
 sudo journalctl -u label-swarm-workers.service -n 100 --no-pager
 sudo tail -n 100 /var/log/cloud-init-output.log
@@ -724,10 +848,70 @@ bash "IaC_Grupo7/IaC CloudFormation/tests/bootstrap.test.sh"
 
 Os testes simulam timeouts, recuperacao, janela esgotada, falha de instalacao e
 falha de sinalizacao, sem acessar AWS nem aguardar os intervalos reais.
+Tambem cobrem brokers saudaveis/falhos nos backends, seu ingresso como workers, ausencia de referencias ao
+manager AZ2, recusa de stack-id antigo, ausencia de nos e etiquetas incompleto.
+Os testes Python de renderizacao usam PyYAML (dependencia do `cfn-lint`) e
+validam contagens, Compose, seguranca, memoria e dashboards dos hosts consolidados.
 
 Evite compartilhar logs ou arquivos que contenham credenciais.
 
 No banco AZ1, acessivel pelo output `DatabaseStandbySshCommand`, confira:
+
+Se o WaitCondition informar `initial-database-backup`, consulte primeiro o
+log do cloud-init: o backup inicial roda no UserData, antes de instalar os
+timers, e nao necessariamente aparece no journal do servico de backup.
+O marcador identifica uma etapa, nao a causa raiz. Nesta versao, as etapas
+sao separadas: `initial-database-backup` (dump/restauracao/validacao),
+`database-recovery-timers` (instalacao dos timers) e `database-standby-ready`
+(publicacao SSM). Em versoes anteriores, as tres compartilhavam a primeira marca.
+
+Se o WaitCondition informar `DatabaseStandbyInstance: configuration`, a marca
+e generica e nao identifica o comando que falhou. Consulte os logs da tentativa
+atual; o erro anterior de `mysqldump` nao pode ser presumido para outra falha.
+O bootstrap agora distingue tambem as etapas anteriores ao primeiro backup:
+
+| Etapa | Operacoes |
+| --- | --- |
+| `database-host-configuration` | Configuracao do hostname |
+| `database-mysql-configuration` | Ativacao de MySQL/SSH, arquivos de configuracao, reinicio e validacao do bind |
+| `database-accounts` | Criacao/atualizacao do usuario da aplicacao e permissoes |
+| `database-recovery-configuration` | Arquivos locais do agente e consulta ao IMDS |
+| `database-recovery-agent` | Obtencao do agente via metadados do CloudFormation |
+| `database-primary-ready` | Espera pelo marcador SSM de prontidao do primario |
+
+Cada etapa acima registra seu inicio, sem imprimir comandos SQL ou credenciais.
+Esses marcadores melhoram o diagnostico; nao corrigem por si a causa da falha.
+Uma alteracao local no template nao muda os logs de uma VM ja criada.
+Colete as evidencias antes de recriar recursos, e nao reexecute todo o cloud-init.
+
+```bash
+sudo tail -n 120 /var/log/cloud-init-output.log
+sudo journalctl -u mysql -n 80 --no-pager
+sudo journalctl -k --no-pager | grep -Ei 'out of memory|oom|killed process' | tail -n 20
+```
+
+Procure o traceback `Operacao de recuperacao falhou` e a ultima mensagem de
+erro de `mysqldump`, `mysql`, disco ou AWS CLI. Nao compartilhe `primary.cnf`,
+UserData ou credenciais. OOM e uma possibilidade em `t3.micro`, nao uma
+conclusao sem logs. Nao amplie privilegios MySQL nem aumente timeouts apenas
+com base no nome da etapa. Nao exclua a stack antes de coletar as evidencias.
+
+Se aparecer `mysqldump: [ERROR] unknown variable 'connect-timeout=5'`, a falha
+ocorre no processamento das opcoes do cliente, antes de exportar os dados.
+O arquivo `/etc/codetracker/primary.cnf` e compartilhado por `mysql` e
+`mysqldump`. Ambos leem `[client]`, mas `connect-timeout` e uma opcao do
+cliente `mysql` que esse `mysqldump` nao aceita. O template agora deixa
+somente host, usuario e senha em `[client]`, e coloca `connect-timeout=5`
+em um grupo separado `[mysql]`. Nao e necessario conceder privilegios extras.
+
+Para uma VM ja criada, insira uma linha `[mysql]` imediatamente antes de
+`connect-timeout=5` no `primary.cnf`, mantendo host, usuario e senha em
+`[client]`. Preserve as permissoes restritivas do arquivo e nao publique seu
+conteudo. Nao execute novamente todo o UserData/cloud-init. Corrigir esse
+arquivo nao conclui os passos seguintes do bootstrap (timers, SSM e sinais)
+nem reverte um WaitCondition ja em `CREATE_FAILED`. Planeje a retomada ou
+nova implantacao de acordo com o estado da stack, preservando os dados.
+O teste offline de configuracao impede que o timeout volte ao grupo `[client]`.
 
 ```bash
 sudo systemctl list-timers 'codetracker-database-*'
@@ -748,7 +932,7 @@ Para um teste de failover em ambiente descartavel, confirme o primeiro dump
 e pare a EC2 `DatabaseInstance` (AZ2) pelo console. Observe a promocao nos
 logs da AZ1 e teste consulta e escrita pelo frontend apos a troca.
 Nao reinicie o antigo principal nem use esse teste com dados a preservar.
-Para o RabbitMQ, use `RabbitMqManagementTunnelCommand` (porta local 15672)
+Para o RabbitMQ local de cada backend, use `RabbitMqManagementTunnelCommand` (porta local 15672)
 ou `RabbitMqAz2ManagementTunnelCommand` (porta local 15673). Os paineis
 mostram brokers e filas separados, nao replicas.
 
@@ -764,14 +948,20 @@ python -m unittest discover -s ".\IaC_Grupo7\IaC CloudFormation\tests" -p databa
   em uma stack existente nao garante reexecutar cloud-init nem atualizar os
   servicos automaticamente. Nao reutilize a WaitConditionHandle de uma criacao
   anterior em uma atualizacao; use uma stack nova para esta versao do bootstrap.
-- O manager e unico: perde-lo impede novos agendamentos. A recuperacao do
-  MySQL e unilateral (AZ2 para AZ1), com perda de dados e interrupcao, nao
+- O manager unico AZ1 fica em `Drain`: perde-lo impede novos agendamentos
+  e mudancas. Nao ha standby tolerante a falhas. O verificador/deploy automatico
+  permanece na AZ1. Para tolerar uma falha de manager, use tres.
+- A recuperacao do MySQL e unilateral (AZ2 para AZ1), com perda de dados e interrupcao, nao
   replicacao continua nem RDS Multi-AZ. A perda da AZ1 remove o standby.
 - Os dois RabbitMQ sao independentes; nao ha sincronizacao de mensagens,
   quorum ou garantia de continuidade dos consumidores.
+  Cada host compartilha recursos e dominio de falha com dois backends e uma replica etiquetas.
+  O volume Docker `rabbitmq-data` e local, nao e backup externo nem armazenamento
+  compartilhado; preserve mensagens e definicoes antes de substituir a EC2.
 - O ALB usa HTTP. Configure HTTPS e cookies seguros antes de uso em producao.
 - O SSH publico do bastion continua aberto no template; restrinja ao seu IP.
-- Ha custos com dez EC2 (`t3.small` por padrao), dois NAT Gateways, ALB,
+- Ha custos com oito EC2 (quatro `t3.micro`, duas `t3.small` e duas `t3.medium`),
+  dois NAT Gateways, ALB,
   dois volumes de dados EBS, zona DNS privada, consultas DNS e IPs publicos.
 - Excluir a stack tambem exclui os volumes e dumps do banco: faca backup antes.
 

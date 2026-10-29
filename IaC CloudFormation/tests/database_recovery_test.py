@@ -3,6 +3,7 @@
 Run: python -m unittest discover -s "IaC_Grupo7\\IaC CloudFormation\\tests" -p database_recovery_test.py
 """
 
+import configparser
 from contextlib import ExitStack
 import json
 import os
@@ -131,6 +132,66 @@ class RecoveryTests(unittest.TestCase):
         restore = self.stack.enter_context(mock.patch.object(self.recovery, "restore"))
         publish = self.stack.enter_context(mock.patch.object(self.recovery, "publish"))
         return fence, restore, publish
+
+    def test_standby_configuration_has_specific_stages_before_commands(self):
+        userdata = STANDBY_RESOURCE.split("      UserData:", 1)[1]
+        configuration = userdata.split("          install_aws_cli\n", 1)[1].split(
+            "          BOOTSTRAP_STAGE=initial-database-backup", 1
+        )[0]
+        self.assertNotIn("BOOTSTRAP_STAGE=configuration", configuration)
+        steps = [
+            ("database-host-configuration", "hostnamectl set-hostname database-standby-az1"),
+            ("database-mysql-configuration", "systemctl enable --now mysql ssh"),
+            ("database-accounts", "mysql <<'SQL'"),
+            ("database-recovery-configuration", "cat > /etc/codetracker/primary.cnf <<'CLIENT'"),
+            ("database-recovery-agent", "aws cloudformation describe-stack-resource"),
+            ("database-primary-ready", "DATABASE_READY=false"),
+        ]
+        position = 0
+        for stage, command in steps:
+            with self.subTest(stage=stage):
+                marker = (
+                    f"BOOTSTRAP_STAGE={stage}\n"
+                    '          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."\n'
+                    f"          {command}"
+                )
+                position = configuration.index(marker, position) + len(marker)
+
+    def test_bootstrap_distinguishes_backup_timers_and_readiness_failures(self):
+        steps = [
+            "BOOTSTRAP_STAGE=initial-database-backup",
+            "/usr/local/sbin/codetracker-database-recovery backup",
+            "BOOTSTRAP_STAGE=database-recovery-timers",
+            "systemctl daemon-reload",
+            "BOOTSTRAP_STAGE=database-standby-ready",
+            "aws ssm put-parameter",
+            "BOOTSTRAP_STAGE=configuration",
+        ]
+        position = 0
+        for step in steps:
+            with self.subTest(step=step):
+                position = STANDBY_RESOURCE.index(step, position) + len(step)
+
+    def test_primary_cnf_scopes_connect_timeout_to_mysql_not_mysqldump(self):
+        match = re.search(
+            r"(?ms)^          cat > /etc/codetracker/primary\.cnf <<'CLIENT'\n"
+            r"(.*?)^          CLIENT$",
+            STANDBY_RESOURCE,
+        )
+        self.assertIsNotNone(match)
+        config = configparser.ConfigParser(interpolation=None)
+        config.read_string(textwrap.dedent(match.group(1)))
+        # Both tools read [client]; only mysql reads [mysql].
+        self.assertEqual(set(config["client"]), {"host", "user", "password"})
+        self.assertEqual(config["client"]["host"], "${DatabaseInstance.PrivateIp}")
+        self.assertEqual(config["client"]["user"], "codetracker_backup")
+        self.assertEqual(config["client"]["password"], '"${DatabasePassword}"')
+        self.assertEqual(config.getint("mysql", "connect-timeout"), 5)
+        dump_options = dict(config["client"])
+        if config.has_section("mysqldump"):
+            dump_options.update(config["mysqldump"])
+        self.assertNotIn("connect-timeout", dump_options)
+        self.assertNotIn("connect_timeout", dump_options)
 
     def test_backup_timer_runs_dump_and_restore_every_twelve_hours(self):
         self.assertRegex(

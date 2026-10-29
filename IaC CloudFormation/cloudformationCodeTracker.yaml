@@ -2,8 +2,8 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >-
   Infraestrutura principal da Lamar Auto Pecas: VPC em duas zonas de
   disponibilidade, instancias EC2, volume EBS, Application Load Balancer,
-  bastion SSH, manager Docker Swarm, MySQL com recuperacao automatica entre
-  AZs e dois brokers RabbitMQ independentes.
+  bastion SSH, um manager Docker Swarm, MySQL com recuperacao automatica
+  entre AZs e um broker RabbitMQ em cada worker backend.
 
 Parameters:
   EnvironmentName:
@@ -18,7 +18,22 @@ Parameters:
   InstanceType:
     Type: String
     Default: t3.small
-    Description: Tipo das instancias EC2 da aplicacao e do banco.
+    Description: Tipo das EC2 manager e bastion.
+
+  BackendInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: Tipo dos dois workers backend; hospedam backend, etiquetas e RabbitMQ.
+
+  DatabaseInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Tipo das EC2 MySQL principal e standby; t3.micro tem 1 GiB de RAM.
+
+  FrontendInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Tipo das duas EC2 frontend; nao altera os managers nas mesmas subnets.
 
   DockerHubNamespace:
     Type: String
@@ -28,7 +43,7 @@ Parameters:
 
   ApplicationImageTag:
     Type: String
-    Default: v1.0.0
+    Default: v1.0.1
     Description: Tag publicada para backend, frontend e etiquetas. O frontend deve usar /api.
     AllowedPattern: '[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}'
 
@@ -57,7 +72,7 @@ Parameters:
   RabbitMqPassword:
     Type: String
     NoEcho: true
-    Description: Senha da aplicacao para conexao com o RabbitMQ.
+    Description: Senha dos brokers RabbitMQ executados nos dois backends.
     MinLength: 12
     AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
     ConstraintDescription: Use ao menos 12 caracteres sem espacos.
@@ -105,6 +120,23 @@ Parameters:
     MinLength: 44
     AllowedPattern: '[a-zA-Z0-9+/]+={0,2}'
     ConstraintDescription: Informe uma chave Base64 de ao menos 32 bytes decodificados.
+
+  MailUsername:
+    Type: String
+    Description: Conta SMTP usada pelo backend e pelas etiquetas para enviar e-mails.
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+  MailPassword:
+    Type: String
+    NoEcho: true
+    Description: Senha da conta SMTP (use senha de app para Gmail).
+    MinLength: 1
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+
+  EtiquetaEmailDestinatario:
+    Type: String
+    Description: E-mail que recebe as etiquetas geradas pelo consumer.
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
 Mappings:
   Bootstrap:
@@ -235,7 +267,7 @@ Resources:
     Properties:
       Handle: !Ref BootstrapSignalHandle
       Timeout: '3600'
-      Count: 10
+      Count: 8
 
   Vpc:
     Type: AWS::EC2::VPC
@@ -690,8 +722,12 @@ Resources:
         Count: 1
         Timeout: PT60M
     DependsOn:
-      - BackendSubnetAz1RouteTableAssociation
+      - WebSubnetAz1RouteTableAssociation
       - PrivateDefaultRouteAz1
+      - SwarmManagementIngress
+      - SwarmDiscoveryTcpIngress
+      - SwarmDiscoveryUdpIngress
+      - SwarmOverlayIngress
     Properties:
       ImageId: !Ref UbuntuAmiId
       InstanceType: !Ref InstanceType
@@ -704,7 +740,7 @@ Resources:
           GroupSet:
             - !Ref PrivateSshSecurityGroup
             - !Ref SwarmSecurityGroup
-          SubnetId: !Ref BackendSubnetAz1
+          SubnetId: !Ref WebSubnetAz1
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-vm-swarm-manager-az1'
@@ -760,17 +796,20 @@ Resources:
             --type SecureString \
             --value "$WORKER_TOKEN" \
             --overwrite
+          unset WORKER_TOKEN
+
+          umask 077
+          printf '%s' '${DatabasePassword}' | docker secret create codetracker-db-password -
+          printf '%s' '${RabbitMqPassword}' | docker secret create codetracker-rabbitmq-password -
+          printf '%s' '${JwtSecret}' | docker secret create codetracker-jwt-secret -
+          printf '%s' '${MailPassword}' | docker secret create codetracker-mail-password -
+          # Libera o ingresso dos workers somente apos criar os secrets.
           aws ssm put-parameter \
             --region "$REGION" \
             --name '/${EnvironmentName}/swarm/stack-id' \
             --type String \
             --value '${AWS::StackId}' \
             --overwrite
-
-          umask 077
-          printf '%s' '${DatabasePassword}' | docker secret create codetracker-db-password -
-          printf '%s' '${RabbitMqPassword}' | docker secret create codetracker-rabbitmq-password -
-          printf '%s' '${JwtSecret}' | docker secret create codetracker-jwt-secret -
           mkdir -p /opt/codetracker
 
           cat > /opt/codetracker/stack.yml <<'STACK'
@@ -783,7 +822,8 @@ Resources:
                 DB_NAME: '${DatabaseName}'
                 DB_USERNAME: '${DatabaseUser}'
                 SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
-                SPRING_RABBITMQ_ADDRESSES: '${RabbitMqInstance.PrivateIp}:5672,${RabbitMqInstanceAz2.PrivateIp}:5672'
+                MAIL_USERNAME: '${MailUsername}'
+                SPRING_RABBITMQ_ADDRESSES: '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
                 SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
                 SPRING_DATASOURCE_HIKARI_CONNECTIONTIMEOUT: '10000'
                 SPRING_DATASOURCE_HIKARI_VALIDATIONTIMEOUT: '5000'
@@ -796,6 +836,8 @@ Resources:
                   target: spring.rabbitmq.password
                 - source: jwt_secret
                   target: JWT_SECRET
+                - source: mail_password
+                  target: MAIL_PASSWORD
               networks:
                 application:
                   aliases: [backend]
@@ -815,14 +857,31 @@ Resources:
               image: ${DockerHubNamespace}/codetracker-etiquetas:${ApplicationImageTag}
               environment:
                 BACKEND_API_BASE_URL: 'http://backend:8080'
+                DB_HOST: '${DatabaseEndpointRecord}'
+                DB_NAME: '${DatabaseName}'
+                DB_USERNAME: '${DatabaseUser}'
+                SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
+                SPRING_JPA_HIBERNATE_DDL_AUTO: 'update'
+                SPRING_RABBITMQ_ADDRESSES: '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
+                SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
+                MAIL_USERNAME: '${MailUsername}'
+                ETIQUETA_EMAIL_DESTINATARIO: '${EtiquetaEmailDestinatario}'
                 JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0'
+              secrets:
+                - source: database_password
+                  target: DB_PASSWORD
+                - source: rabbitmq_password
+                  target: spring.rabbitmq.password
+                - source: mail_password
+                  target: MAIL_PASSWORD
               networks:
                 application:
                   aliases: [etiquetas]
               deploy:
-                replicas: 1
+                replicas: 2
                 placement:
                   constraints: [node.labels.tier == backend]
+                  max_replicas_per_node: 1
                 resources:
                   limits:
                     memory: 512M
@@ -864,6 +923,9 @@ Resources:
             jwt_secret:
               external: true
               name: codetracker-jwt-secret
+            mail_password:
+              external: true
+              name: codetracker-mail-password
           STACK
 
           cat > /usr/local/sbin/label-swarm-workers <<'SCRIPT'
@@ -893,6 +955,7 @@ Resources:
             ALL_WORKERS_READY=true
 
             while read -r NODE_NAME TIER ZONE; do
+              [ -n "$NODE_NAME" ] || continue
               NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}} {{.Status}}' | awk '$2 == "Ready" && !found { print $1; found = 1 }')
 
               if [ -z "$NODE_ID" ]; then
@@ -919,7 +982,7 @@ Resources:
           done
 
           if [ "$WORKERS_READY" != true ]; then
-            echo "Os quatro workers nao ficaram prontos no Swarm apos 10 minutos." >&2
+            echo "Os workers previstos nao ficaram prontos no Swarm apos 10 minutos." >&2
             docker node ls >&2
             exit 1
           fi
@@ -952,7 +1015,7 @@ Resources:
               --format '{{.Name}} {{.Replicas}}' | awk '
                 $1 == "codetracker_backend" && $2 == "4/4" { ready++ }
                 $1 == "codetracker_frontend" && $2 == "2/2" { ready++ }
-                $1 == "codetracker_etiquetas" && $2 == "1/1" { ready++ }
+                $1 == "codetracker_etiquetas" && $2 == "2/2" { ready++ }
                 END { print ready + 0 }
               ')
 
@@ -1023,7 +1086,7 @@ Resources:
       - SwarmOverlayIngress
     Properties:
       ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref BackendInstanceType
       IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
@@ -1032,6 +1095,7 @@ Resources:
           DeviceIndex: '0'
           GroupSet:
             - !Ref BackendSecurityGroup
+            - !Ref RabbitMqSecurityGroup
             - !Ref PrivateSshSecurityGroup
             - !Ref SwarmSecurityGroup
           SubnetId: !Ref BackendSubnetAz1
@@ -1063,6 +1127,36 @@ Resources:
             http://169.254.169.254/latest/dynamic/instance-identity/document \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["region"])')
 
+          BOOTSTRAP_STAGE=rabbitmq-start
+          docker volume create rabbitmq-data
+          docker run --detach \
+            --name rabbitmq \
+            --hostname rabbitmq-az1 \
+            --restart unless-stopped \
+            --memory 1g \
+            --publish 5672:5672 \
+            --publish 127.0.0.1:15672:15672 \
+            --health-cmd 'rabbitmq-diagnostics -q ping' \
+            --health-interval 30s \
+            --health-timeout 10s \
+            --health-retries 5 \
+            --env RABBITMQ_DEFAULT_USER='${RabbitMqUser}' \
+            --env RABBITMQ_DEFAULT_PASS='${RabbitMqPassword}' \
+            --env RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS='-rabbit vm_memory_high_watermark {absolute,536870912}' \
+            --volume rabbitmq-data:/var/lib/rabbitmq \
+            rabbitmq:4-management-alpine
+          for attempt in $(seq 1 60); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" = healthy ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" != healthy ]; then
+            echo "RabbitMQ no backend AZ1 nao ficou saudavel." >&2
+            exit 1
+          fi
+
+          BOOTSTRAP_STAGE=swarm-worker-join
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
             for attempt in $(seq 1 90); do
               if MANAGER_STACK=$(aws ssm get-parameter \
@@ -1108,7 +1202,7 @@ Resources:
       - SwarmOverlayIngress
     Properties:
       ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref BackendInstanceType
       IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
@@ -1117,6 +1211,7 @@ Resources:
           DeviceIndex: '0'
           GroupSet:
             - !Ref BackendSecurityGroup
+            - !Ref RabbitMqSecurityGroup
             - !Ref PrivateSshSecurityGroup
             - !Ref SwarmSecurityGroup
           SubnetId: !Ref BackendSubnetAz2
@@ -1148,6 +1243,36 @@ Resources:
             http://169.254.169.254/latest/dynamic/instance-identity/document \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["region"])')
 
+          BOOTSTRAP_STAGE=rabbitmq-start
+          docker volume create rabbitmq-data
+          docker run --detach \
+            --name rabbitmq \
+            --hostname rabbitmq-az2 \
+            --restart unless-stopped \
+            --memory 1g \
+            --publish 5672:5672 \
+            --publish 127.0.0.1:15672:15672 \
+            --health-cmd 'rabbitmq-diagnostics -q ping' \
+            --health-interval 30s \
+            --health-timeout 10s \
+            --health-retries 5 \
+            --env RABBITMQ_DEFAULT_USER='${RabbitMqUser}' \
+            --env RABBITMQ_DEFAULT_PASS='${RabbitMqPassword}' \
+            --env RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS='-rabbit vm_memory_high_watermark {absolute,536870912}' \
+            --volume rabbitmq-data:/var/lib/rabbitmq \
+            rabbitmq:4-management-alpine
+          for attempt in $(seq 1 60); do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" = healthy ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" != healthy ]; then
+            echo "RabbitMQ no backend AZ2 nao ficou saudavel." >&2
+            exit 1
+          fi
+
+          BOOTSTRAP_STAGE=swarm-worker-join
           if [ "$(docker info --format '{{.Swarm.LocalNodeState}}')" = "inactive" ]; then
             for attempt in $(seq 1 90); do
               if MANAGER_STACK=$(aws ssm get-parameter \
@@ -1182,135 +1307,6 @@ Resources:
 
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
 
-  RabbitMqInstance:
-    Type: AWS::EC2::Instance
-    DependsOn:
-      - BackendSubnetAz1RouteTableAssociation
-      - PrivateDefaultRouteAz1
-    Properties:
-      ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
-      IamInstanceProfile: !Ref InstanceProfileName
-      KeyName: !Ref KeyName
-      NetworkInterfaces:
-        - AssociatePublicIpAddress: false
-          DeleteOnTermination: true
-          DeviceIndex: '0'
-          GroupSet:
-            - !Ref RabbitMqSecurityGroup
-            - !Ref PrivateSshSecurityGroup
-          SubnetId: !Ref BackendSubnetAz1
-      Tags:
-        - Key: Name
-          Value: !Sub '${EnvironmentName}-vm-rabbitmq-az1'
-      UserData:
-        Fn::Base64: !Sub
-        - |
-          #!/bin/bash
-          BOOTSTRAP_RESOURCE=RabbitMqInstance
-          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
-          ${BootstrapScript}
-
-          install_packages docker.io openssh-server ca-certificates curl
-
-          hostnamectl set-hostname rabbitmq-az1
-          systemctl enable --now docker
-          systemctl enable --now ssh
-          usermod -aG docker ubuntu
-
-          docker volume create rabbitmq-data
-          docker run --detach \
-            --name rabbitmq \
-            --hostname rabbitmq \
-            --restart unless-stopped \
-            --publish 5672:5672 \
-            --publish 15672:15672 \
-            --health-cmd 'rabbitmq-diagnostics -q ping' \
-            --health-interval 30s \
-            --health-timeout 10s \
-            --health-retries 5 \
-            --env RABBITMQ_DEFAULT_USER='${RabbitMqUser}' \
-            --env RABBITMQ_DEFAULT_PASS='${RabbitMqPassword}' \
-            --volume rabbitmq-data:/var/lib/rabbitmq \
-            rabbitmq:4-management-alpine
-
-          for attempt in $(seq 1 60); do
-            if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" = healthy ]; then
-              break
-            fi
-            sleep 5
-          done
-          if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" != healthy ]; then
-            echo "RabbitMQ AZ1 nao ficou saudavel." >&2
-            exit 1
-          fi
-
-        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
-
-  RabbitMqInstanceAz2:
-    Type: AWS::EC2::Instance
-    DependsOn:
-      - BackendSubnetAz2RouteTableAssociation
-      - PrivateDefaultRouteAz2
-    Properties:
-      ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
-      IamInstanceProfile: !Ref InstanceProfileName
-      KeyName: !Ref KeyName
-      NetworkInterfaces:
-        - AssociatePublicIpAddress: false
-          DeleteOnTermination: true
-          DeviceIndex: '0'
-          GroupSet:
-            - !Ref RabbitMqSecurityGroup
-            - !Ref PrivateSshSecurityGroup
-          SubnetId: !Ref BackendSubnetAz2
-      Tags:
-        - Key: Name
-          Value: !Sub '${EnvironmentName}-vm-rabbitmq-az2'
-      UserData:
-        Fn::Base64: !Sub
-        - |
-          #!/bin/bash
-          BOOTSTRAP_RESOURCE=RabbitMqInstanceAz2
-          BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
-          ${BootstrapScript}
-
-          install_packages docker.io openssh-server ca-certificates curl
-          hostnamectl set-hostname rabbitmq-az2
-          systemctl enable --now docker
-          systemctl enable --now ssh
-          usermod -aG docker ubuntu
-
-          docker volume create rabbitmq-data
-          docker run --detach \
-            --name rabbitmq \
-            --hostname rabbitmq-az2 \
-            --restart unless-stopped \
-            --publish 5672:5672 \
-            --publish 15672:15672 \
-            --health-cmd 'rabbitmq-diagnostics -q ping' \
-            --health-interval 30s \
-            --health-timeout 10s \
-            --health-retries 5 \
-            --env RABBITMQ_DEFAULT_USER='${RabbitMqUser}' \
-            --env RABBITMQ_DEFAULT_PASS='${RabbitMqPassword}' \
-            --volume rabbitmq-data:/var/lib/rabbitmq \
-            rabbitmq:4-management-alpine
-
-          for attempt in $(seq 1 60); do
-            if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" = healthy ]; then
-              break
-            fi
-            sleep 5
-          done
-          if [ "$(docker inspect --format '{{.State.Health.Status}}' rabbitmq)" != healthy ]; then
-            echo "RabbitMQ AZ2 nao ficou saudavel." >&2
-            exit 1
-          fi
-
-        - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
-
   DatabaseDataVolume:
     Type: AWS::EC2::Volume
     Properties:
@@ -1329,7 +1325,7 @@ Resources:
       - PrivateDefaultRouteAz2
     Properties:
       ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref DatabaseInstanceType
       IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
@@ -1727,7 +1723,7 @@ Resources:
                 sys.exit(1)
     Properties:
       ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref DatabaseInstanceType
       IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
@@ -1777,7 +1773,11 @@ Resources:
 
           install_packages mysql-server python3 ca-certificates curl unzip openssh-server
           install_aws_cli
+          BOOTSTRAP_STAGE=database-host-configuration
+          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."
           hostnamectl set-hostname database-standby-az1
+          BOOTSTRAP_STAGE=database-mysql-configuration
+          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."
           systemctl enable --now mysql ssh
           umask 077
           mkdir -p /etc/codetracker /var/lib/mysql/.codetracker-recovery
@@ -1799,6 +1799,8 @@ Resources:
             echo "MySQL AZ1 nao esta escutando na rede privada." >&2
             exit 1
           fi
+          BOOTSTRAP_STAGE=database-accounts
+          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."
           mysql <<'SQL'
           SET GLOBAL super_read_only=OFF;
           SET GLOBAL read_only=OFF;
@@ -1809,11 +1811,15 @@ Resources:
           SET GLOBAL super_read_only=ON;
           SQL
 
+          BOOTSTRAP_STAGE=database-recovery-configuration
+          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."
           cat > /etc/codetracker/primary.cnf <<'CLIENT'
           [client]
           host=${DatabaseInstance.PrivateIp}
           user=codetracker_backup
           password="${DatabasePassword}"
+
+          [mysql]
           connect-timeout=5
           CLIENT
           IMDS_TOKEN=$(curl --fail --silent --show-error --request PUT \
@@ -1834,6 +1840,8 @@ Resources:
             "role_config": "/etc/mysql/mysql.conf.d/zz-standby-role.cnf"
           }
           CONFIG
+          BOOTSTRAP_STAGE=database-recovery-agent
+          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."
           aws cloudformation describe-stack-resource \
             --region '${AWS::Region}' --stack-name '${AWS::StackId}' \
             --logical-resource-id DatabaseStandbyInstance \
@@ -1842,6 +1850,8 @@ Resources:
             > /usr/local/sbin/codetracker-database-recovery
           chmod 700 /usr/local/sbin/codetracker-database-recovery
 
+          BOOTSTRAP_STAGE=database-primary-ready
+          log_bootstrap "Iniciando etapa $BOOTSTRAP_STAGE."
           DATABASE_READY=false
           for attempt in $(seq 1 90); do
             DATABASE_STACK=$(aws ssm get-parameter \
@@ -1860,6 +1870,7 @@ Resources:
           BOOTSTRAP_STAGE=initial-database-backup
           /usr/local/sbin/codetracker-database-recovery backup
 
+          BOOTSTRAP_STAGE=database-recovery-timers
           cat > /etc/systemd/system/codetracker-database-backup.service <<'SERVICE'
           [Unit]
           Description=Copia automatica do MySQL AZ2 para AZ1
@@ -1901,6 +1912,7 @@ Resources:
           TIMER
           systemctl daemon-reload
           systemctl enable --now codetracker-database-backup.timer codetracker-database-failover.timer
+          BOOTSTRAP_STAGE=database-standby-ready
           aws ssm put-parameter \
             --region '${AWS::Region}' --name '/${EnvironmentName}/database/standby-ready' \
             --type String --value '${AWS::StackId}' --overwrite
@@ -1925,7 +1937,7 @@ Resources:
       - SwarmOverlayIngress
     Properties:
       ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref FrontendInstanceType
       IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
@@ -2010,7 +2022,7 @@ Resources:
       - SwarmOverlayIngress
     Properties:
       ImageId: !Ref UbuntuAmiId
-      InstanceType: !Ref InstanceType
+      InstanceType: !Ref FrontendInstanceType
       IamInstanceProfile: !Ref InstanceProfileName
       KeyName: !Ref KeyName
       NetworkInterfaces:
@@ -2152,6 +2164,7 @@ Outputs:
     Description: Comando base para enviar arquivos ao manager pelo bastion.
     Value: !Sub 'sftp -i <chave.pem> -o ProxyJump=ubuntu@${BastionEip} ubuntu@${SwarmManagerInstance.PrivateIp}'
 
+
   DatabasePrivateIp:
     Description: IP do banco original AZ2; nao acompanha o failover. Use DatabaseEndpoint.
     Value: !GetAtt DatabaseInstance.PrivateIp
@@ -2173,33 +2186,33 @@ Outputs:
     Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${DatabaseStandbyInstance.PrivateIp}'
 
   RabbitMqPrivateIp:
-    Description: Endereco IP privado da instancia EC2 do RabbitMQ.
-    Value: !GetAtt RabbitMqInstance.PrivateIp
+    Description: IP do backend AZ1 que tambem hospeda RabbitMQ e etiquetas.
+    Value: !GetAtt BackendInstanceAz1.PrivateIp
 
   RabbitMqAmqpEndpoint:
     Description: Broker independente AZ1; filas nao sao replicadas para AZ2.
-    Value: !Sub 'amqp://${RabbitMqInstance.PrivateIp}:5672'
+    Value: !Sub 'amqp://${BackendInstanceAz1.PrivateIp}:5672'
 
   RabbitMqSshCommand:
-    Description: Comando base para acessar a VM RabbitMQ pelo bastion.
-    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${RabbitMqInstance.PrivateIp}'
+    Description: Acesso ao backend AZ1 e seu broker RabbitMQ pelo bastion.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${BackendInstanceAz1.PrivateIp}'
 
   RabbitMqManagementTunnelCommand:
     Description: Tunel SSH para acessar a interface RabbitMQ em http://localhost:15672.
-    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15672:localhost:15672 ubuntu@${RabbitMqInstance.PrivateIp}'
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15672:localhost:15672 ubuntu@${BackendInstanceAz1.PrivateIp}'
 
   RabbitMqAz2PrivateIp:
-    Description: IP privado do segundo broker independente na AZ2.
-    Value: !GetAtt RabbitMqInstanceAz2.PrivateIp
+    Description: IP do backend AZ2 que tambem hospeda RabbitMQ e etiquetas.
+    Value: !GetAtt BackendInstanceAz2.PrivateIp
 
   RabbitMqAddresses:
     Description: Lista de brokers enviada ao Spring AMQP; nao replica filas ou mensagens.
-    Value: !Sub '${RabbitMqInstance.PrivateIp}:5672,${RabbitMqInstanceAz2.PrivateIp}:5672'
+    Value: !Sub '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
 
   RabbitMqAz2SshCommand:
-    Description: Acesso SSH ao broker independente AZ2 pelo bastion.
-    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${RabbitMqInstanceAz2.PrivateIp}'
+    Description: Acesso ao backend AZ2 e seu broker RabbitMQ pelo bastion.
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} ubuntu@${BackendInstanceAz2.PrivateIp}'
 
   RabbitMqAz2ManagementTunnelCommand:
     Description: Tunel local 15673 para o painel do broker AZ2.
-    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15673:localhost:15672 ubuntu@${RabbitMqInstanceAz2.PrivateIp}'
+    Value: !Sub 'ssh -i <chave.pem> -J ubuntu@${BastionEip} -L 15673:localhost:15672 ubuntu@${BackendInstanceAz2.PrivateIp}'

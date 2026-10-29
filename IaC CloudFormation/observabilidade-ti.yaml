@@ -16,11 +16,6 @@ Parameters:
   DatabaseStandbyVolumeId:
     Type: String
     Description: ID do volume EBS do MySQL standby na AZ1 da stack principal.
-  RabbitMqInstanceId:
-    Type: AWS::EC2::Instance::Id
-  RabbitMqInstanceAz2Id:
-    Type: AWS::EC2::Instance::Id
-    Description: ID da instancia RabbitMQ independente na AZ2 da stack principal.
   SwarmManagerInstanceId:
     Type: AWS::EC2::Instance::Id
   WebAz1InstanceId:
@@ -136,13 +131,11 @@ Resources:
                 "metrics": [
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL primario AZ2"}],
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${DatabaseStandbyInstanceId}", {"label": "MySQL standby AZ1"}],
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ AZ1"}],
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${RabbitMqInstanceAz2Id}", {"label": "RabbitMQ independente AZ2"}],
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Swarm manager"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Swarm manager AZ1"}],
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
                   ["AWS/EC2", "CPUUtilization", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend AZ1"}],
-                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend AZ2"}]
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend + etiquetas + RabbitMQ AZ1"}],
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend + etiquetas + RabbitMQ AZ2"}]
                 ]
               }
             },
@@ -153,13 +146,11 @@ Resources:
                 "metrics": [
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL primario AZ2"}],
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${DatabaseStandbyInstanceId}", {"label": "MySQL standby AZ1"}],
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ AZ1"}],
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${RabbitMqInstanceAz2Id}", {"label": "RabbitMQ independente AZ2"}],
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager AZ1"}],
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
                   ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend AZ1"}],
-                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend AZ2"}]
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend + etiquetas + RabbitMQ AZ1"}],
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend + etiquetas + RabbitMQ AZ2"}]
                 ]
               }
             },
@@ -210,13 +201,11 @@ Resources:
                 "metrics": [
                   ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${DatabaseInstanceId}", {"label": "MySQL AZ2"}],
                   ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${DatabaseStandbyInstanceId}", {"label": "MySQL AZ1"}],
-                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager"}],
-                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend AZ1"}],
-                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend AZ2"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${SwarmManagerInstanceId}", {"label": "Manager AZ1"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${BackendAz1InstanceId}", {"label": "Backend + etiquetas + RabbitMQ AZ1"}],
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${BackendAz2InstanceId}", {"label": "Backend + etiquetas + RabbitMQ AZ2"}],
                   ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${WebAz1InstanceId}", {"label": "Web AZ1"}],
-                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}],
-                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${RabbitMqInstanceId}", {"label": "RabbitMQ AZ1"}],
-                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${RabbitMqInstanceAz2Id}", {"label": "RabbitMQ AZ2"}]
+                  ["AWS/EC2", "CPUCreditBalance", "InstanceId", "${WebAz2InstanceId}", {"label": "Web AZ2"}]
                 ]
               }
             }
@@ -249,40 +238,6 @@ Resources:
       Dimensions:
         - Name: InstanceId
           Value: !Ref DatabaseStandbyInstanceId
-      Statistic: Maximum
-      Period: 60
-      EvaluationPeriods: 2
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: missing
-      AlarmActions: [!Ref OperationsTopic]
-
-  RabbitMqStatusAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub '${EnvironmentName}-rabbitmq-az1-status-ec2'
-      Namespace: AWS/EC2
-      MetricName: StatusCheckFailed
-      Dimensions:
-        - Name: InstanceId
-          Value: !Ref RabbitMqInstanceId
-      Statistic: Maximum
-      Period: 60
-      EvaluationPeriods: 2
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: missing
-      AlarmActions: [!Ref OperationsTopic]
-
-  RabbitMqAz2StatusAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub '${EnvironmentName}-rabbitmq-az2-status-ec2'
-      Namespace: AWS/EC2
-      MetricName: StatusCheckFailed
-      Dimensions:
-        - Name: InstanceId
-          Value: !Ref RabbitMqInstanceAz2Id
       Statistic: Maximum
       Period: 60
       EvaluationPeriods: 2
@@ -332,7 +287,7 @@ Resources:
   ApplicationInstancesStatusAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmDescription: Falha de status em manager, web ou backend. Consulte o painel para identificar a EC2.
+      AlarmDescription: Falha de status no manager AZ1, web ou backend. Nao verifica saude do Swarm.
       Metrics:
         - Id: failures
           Expression: MAX([manager,web1,web2,backend1,backend2])
