@@ -378,7 +378,16 @@ Parametros a preencher:
   5.1 e no PowerShell 7.
 - `MailUsername`: conta de e-mail SMTP que envia e-mails do backend e etiquetas.
 - `MailPassword`: senha SMTP dessa conta (senha de app no Gmail); a senha
-  antiga presente em imagens anteriores deve ser revogada.
+  antiga presente em imagens anteriores deve ser revogada. Nao exige maiusculas,
+  numeros ou simbolos: aceita a senha de app como `xxxx xxxx xxxx xxxx` ou sem
+  espacos. Para contas `gmail.com`/`googlemail.com`, o bootstrap remove somente
+  os espacos de apresentacao antes de criar o secret compartilhado por backend
+  e etiquetas. Para outros provedores, preserva a senha exatamente como enviada.
+  O valor deve ser nao vazio e continua com `NoEcho`; Base64 no bootstrap evita
+  interpretacao pelo shell, mas nao criptografa a senha. Nao publique UserData.
+  Em um cluster existente, atualizar o parametro nao reexecuta automaticamente
+  o UserData nem substitui o Docker secret: planeje a rotacao e atualize ambos
+  os servicos, sem recriar a stack ou expor a senha em comandos/logs.
 - `EtiquetaEmailDestinatario`: e-mail que recebera as etiquetas geradas.
 - `InstanceType`: `t3.small` por padrao, somente manager e bastion.
 - `BackendInstanceType`: `t3.medium` por padrao, nos dois workers backend.

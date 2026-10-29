@@ -1,8 +1,11 @@
 """Offline contracts for backend/RabbitMQ consolidation (requires PyYAML)."""
 
+import base64
 import collections
 from pathlib import Path
 import re
+import subprocess
+import sys
 import unittest
 
 import yaml
@@ -57,6 +60,8 @@ class Renderer:
         key, argument = next(iter(value.items()))
         if key == "Ref":
             return self.parameters.get(argument, argument)
+        if key == "Fn::Base64":
+            return base64.b64encode(self.render(argument).encode("utf-8")).decode("ascii")
         if key == "Condition":
             return self.condition(argument)
         if key == "Fn::If":
@@ -185,6 +190,42 @@ class SwarmConfigurationTests(unittest.TestCase):
         self.assertNotIn("Default", password)
         self.assertEqual(password["MinLength"], 12)
         self.assertTrue(password["NoEcho"])
+
+    def test_smtp_password_has_no_character_restriction(self):
+        password = self.template["Parameters"]["MailPassword"]
+        self.assertNotIn("AllowedPattern", password)
+        self.assertNotIn("AllowedValues", password)
+        self.assertTrue(password["NoEcho"])
+        self.assertEqual(password["MinLength"], 1)
+        for name in ("DatabasePassword", "RabbitMqPassword", "AdminPassword"):
+            self.assertIn("AllowedPattern", self.template["Parameters"][name])
+
+    def test_smtp_password_is_encoded_before_shell_interpolation(self):
+        source, variables = self.template["Resources"]["SwarmManagerInstance"]["Properties"]["UserData"]["Fn::Base64"]["Fn::Sub"]
+        self.assertNotIn("${MailPassword}", source)
+        self.assertEqual(variables["MailPasswordBase64"], {"Fn::Base64": {"Ref": "MailPassword"}})
+
+    def test_smtp_secret_normalizes_only_gmail_display_spaces(self):
+        cases = (
+            ("remetente@gmail.com", "xxxx xxxx xxxx xxxx", "xxxxxxxxxxxxxxxx"),
+            ("remetente@gmail.com", "xxxxxxxxxxxxxxxx", "xxxxxxxxxxxxxxxx"),
+            ("remetente@GoogleMail.COM", "abcd efgh ijkl mnop", "abcdefghijklmnop"),
+            ("remetente@example.com", "a b'\"$()\\;`<>\né", "a b'\"$()\\;`<>\né"),
+        )
+        for username, password, expected in cases:
+            with self.subTest(username=username):
+                renderer = Renderer(self.template, MailUsername=username, MailPassword=password)
+                script = renderer.render(self.template["Resources"]["SwarmManagerInstance"]["Properties"]["UserData"]["Fn::Base64"])
+                pipeline = script.split("# Base64", 1)[1].split("# Libera", 1)[0]
+                encoded = re.search(r"printf '%s' '([^']*)' \| base64 --decode", pipeline).group(1)
+                command = re.search(r"python3 -c '([^']*)' '([^']*)'", pipeline)
+                result = subprocess.run(
+                    [sys.executable, "-c", command.group(1), command.group(2)],
+                    input=base64.b64decode(encoded), capture_output=True, check=True,
+                )
+                self.assertEqual(result.stdout, expected.encode("utf-8"))
+                self.assertEqual(result.stderr, b"")
+                self.assertIn("| docker secret create codetracker-mail-password -", pipeline)
 
     def test_broker_memory_limit_leaves_headroom_on_medium(self):
         for name in ("BackendInstanceAz1", "BackendInstanceAz2"):

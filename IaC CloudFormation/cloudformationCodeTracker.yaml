@@ -129,9 +129,8 @@ Parameters:
   MailPassword:
     Type: String
     NoEcho: true
-    Description: Senha da conta SMTP (use senha de app para Gmail).
+    Description: Senha SMTP; no Gmail, cole a senha de app com ou sem espacos de apresentacao.
     MinLength: 1
-    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
 
   EtiquetaEmailDestinatario:
     Type: String
@@ -802,7 +801,11 @@ Resources:
           printf '%s' '${DatabasePassword}' | docker secret create codetracker-db-password -
           printf '%s' '${RabbitMqPassword}' | docker secret create codetracker-rabbitmq-password -
           printf '%s' '${JwtSecret}' | docker secret create codetracker-jwt-secret -
-          printf '%s' '${MailPassword}' | docker secret create codetracker-mail-password -
+          # Base64 evita interpretar caracteres da senha como comandos; nao e criptografia.
+          # Somente Gmail remove os espacos usados na apresentacao da senha de app.
+          printf '%s' '${MailPasswordBase64}' | base64 --decode \
+            | python3 -c 'import sys; value = sys.stdin.buffer.read(); gmail = sys.argv[1].lower().endswith(("@gmail.com", "@googlemail.com")); sys.stdout.buffer.write(value.replace(b" ", b"") if gmail else value)' '${MailUsername}' \
+            | docker secret create codetracker-mail-password -
           # Libera o ingresso dos workers somente apos criar os secrets.
           aws ssm put-parameter \
             --region "$REGION" \
@@ -1074,6 +1077,8 @@ Resources:
           systemctl enable label-swarm-workers.service
           systemctl start --no-block label-swarm-workers.service
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+          MailPasswordBase64:
+            Fn::Base64: !Ref MailPassword
 
   BackendInstanceAz1:
     Type: AWS::EC2::Instance
