@@ -1,0 +1,352 @@
+{
+  "tool": "c3x 0.3.21 (windows/amd64, go1.27.3)",
+  "region": "us-east-1",
+  "currency": "USD",
+  "days": 30,
+  "compute_hours": 480,
+  "calendar_hours": 720,
+  "original_root_gb_assumption": 8,
+  "generated_at": "2026-11-02T22:01:21Z",
+  "scenarios": {
+    "atual": {
+      "total": "187.6920000",
+      "groups": {
+        "IPv4": "18.000",
+        "EBS": "8.32",
+        "EC2": "79.8720",
+        "NAT": "64.800",
+        "ALB": "16.2000",
+        "Route53": "0.5000000"
+      },
+      "rows": [
+        {
+          "group": "IPv4",
+          "resource": "aws_eip.NatEipAz2",
+          "dimension": "ip_hours",
+          "quantity": "720",
+          "unit_rate": "0.005",
+          "cost": "3.600",
+          "source": "c3x:static"
+        },
+        {
+          "group": "EBS",
+          "resource": "aws_ebs_volume.DatabaseDataVolume",
+          "dimension": "storage",
+          "quantity": "20",
+          "unit_rate": "0.08",
+          "cost": "1.60",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.DatabaseStandbyInstance",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0104",
+          "cost": "4.9920",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.WebInstanceAz1",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0104",
+          "cost": "4.9920",
+          "source": "c3x:live"
+        },
+        {
+          "group": "IPv4",
+          "resource": "aws_eip.BastionEip",
+          "dimension": "ip_hours",
+          "quantity": "720",
+          "unit_rate": "0.005",
+          "cost": "3.600",
+          "source": "c3x:static"
+        },
+        {
+          "group": "NAT",
+          "resource": "aws_nat_gateway.NatGatewayAz2",
+          "dimension": "gateway_hours",
+          "quantity": "720",
+          "unit_rate": "0.045",
+          "cost": "32.400",
+          "source": "c3x:live"
+        },
+        {
+          "group": "NAT",
+          "resource": "aws_nat_gateway.NatGatewayAz2",
+          "dimension": "data_processing",
+          "quantity": "0",
+          "unit_rate": "0.045",
+          "cost": "0.000",
+          "source": "c3x:live"
+        },
+        {
+          "group": "NAT",
+          "resource": "aws_nat_gateway.NatGatewayAz1",
+          "dimension": "gateway_hours",
+          "quantity": "720",
+          "unit_rate": "0.045",
+          "cost": "32.400",
+          "source": "c3x:live"
+        },
+        {
+          "group": "NAT",
+          "resource": "aws_nat_gateway.NatGatewayAz1",
+          "dimension": "data_processing",
+          "quantity": "0",
+          "unit_rate": "0.045",
+          "cost": "0.000",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.BastionInstance",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0208",
+          "cost": "9.9840",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.WebInstanceAz2",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0104",
+          "cost": "4.9920",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.SwarmManagerInstance",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0208",
+          "cost": "9.9840",
+          "source": "c3x:live"
+        },
+        {
+          "group": "ALB",
+          "resource": "aws_lb.ApplicationLoadBalancer",
+          "dimension": "lb_hours",
+          "quantity": "720",
+          "unit_rate": "0.0225",
+          "cost": "16.2000",
+          "source": "c3x:live"
+        },
+        {
+          "group": "ALB",
+          "resource": "aws_lb.ApplicationLoadBalancer",
+          "dimension": "lcu_hours",
+          "quantity": "0",
+          "unit_rate": "0.008",
+          "cost": "0.000",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.BackendInstanceAz2",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0416",
+          "cost": "19.9680",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EBS",
+          "resource": "aws_ebs_volume.DatabaseStandbyDataVolume",
+          "dimension": "storage",
+          "quantity": "20",
+          "unit_rate": "0.08",
+          "cost": "1.60",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.DatabaseInstance",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0104",
+          "cost": "4.9920",
+          "source": "c3x:live"
+        },
+        {
+          "group": "IPv4",
+          "resource": "aws_eip.NatEipAz1",
+          "dimension": "ip_hours",
+          "quantity": "720",
+          "unit_rate": "0.005",
+          "cost": "3.600",
+          "source": "c3x:static"
+        },
+        {
+          "group": "Route53",
+          "resource": "aws_route53_zone.DatabasePrivateHostedZone",
+          "dimension": "hosted_zone",
+          "quantity": "1",
+          "unit_rate": "0.50",
+          "cost": "0.50",
+          "source": "https://aws.amazon.com/route53/pricing/"
+        },
+        {
+          "group": "Route53",
+          "resource": "aws_route53_zone.DatabasePrivateHostedZone",
+          "dimension": "queries",
+          "quantity": "0",
+          "unit_rate": "6E-7",
+          "cost": "0E-7",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EC2",
+          "resource": "aws_instance.BackendInstanceAz1",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0416",
+          "cost": "19.9680",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EBS",
+          "resource": "BastionInstance",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "SwarmManagerInstance",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "BackendInstanceAz1",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "BackendInstanceAz2",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "DatabaseInstance",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "DatabaseStandbyInstance",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "WebInstanceAz1",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "EBS",
+          "resource": "WebInstanceAz2",
+          "dimension": "assumed_root_gp3_gb",
+          "quantity": "8",
+          "unit_rate": "0.08",
+          "cost": "0.64",
+          "source": "premissa: disco raiz da AMI nao declarado no template"
+        },
+        {
+          "group": "IPv4",
+          "resource": "ApplicationLoadBalancer",
+          "dimension": "alb_minimum_ip_hours",
+          "quantity": "1440",
+          "unit_rate": "0.005",
+          "cost": "7.200",
+          "source": "minimo: um IPv4 por subnet do ALB"
+        }
+      ]
+    },
+    "economica": {
+      "total": "13.0241370002500",
+      "groups": {
+        "EC2": "9.0240",
+        "EBS": "1.60",
+        "Lambda": "0.0001370002500",
+        "IPv4": "2.400"
+      },
+      "rows": [
+        {
+          "group": "EC2",
+          "resource": "aws_instance.ApplicationInstance",
+          "dimension": "compute_hours",
+          "quantity": "480",
+          "unit_rate": "0.0188",
+          "cost": "9.0240",
+          "source": "c3x:live"
+        },
+        {
+          "group": "EBS",
+          "resource": "aws_instance.ApplicationInstance",
+          "dimension": "root_volume",
+          "quantity": "20",
+          "unit_rate": "0.08",
+          "cost": "1.60",
+          "source": "c3x:live"
+        },
+        {
+          "group": "Lambda",
+          "resource": "aws_lambda_function.ScheduleFunction",
+          "dimension": "requests",
+          "quantity": "60",
+          "unit_rate": "2E-7",
+          "cost": "0.0000120",
+          "source": "c3x:live"
+        },
+        {
+          "group": "Lambda",
+          "resource": "aws_lambda_function.ScheduleFunction",
+          "dimension": "duration",
+          "quantity": "7.500",
+          "unit_rate": "0.0000166667",
+          "cost": "0.0001250002500",
+          "source": "c3x:live"
+        },
+        {
+          "group": "IPv4",
+          "resource": "ApplicationInstance",
+          "dimension": "ephemeral_ip_hours",
+          "quantity": "480",
+          "unit_rate": "0.005",
+          "cost": "2.400",
+          "source": "tarifa IPv4 c3x; endereco liberado no stop"
+        }
+      ]
+    }
+  },
+  "saving_percent": "93.06089923904588368177652750"
+}

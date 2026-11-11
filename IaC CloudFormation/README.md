@@ -1,5 +1,120 @@
 # Deploy da aplicacao com CloudFormation e Docker Swarm
 
+## Versao de custo minimo (stack separada)
+
+O template `cloudformationCodeTracker-economica.yaml` e uma alternativa para
+demonstracao/baixo trafego; **nao substitui nem altera o template principal**.
+Concentra MySQL, RabbitMQ, backend, etiquetas e frontend em uma unica
+`t3a.small` x86 (2 vCPU, 2 GiB), com Docker Compose, disco gp3 de 20 GB e
+swap de 2 GiB. Remove ALB, NAT, bastion, manager Swarm, segunda AZ, replicas,
+DNS privado, backup e failover. Mantem somente HTTP publico e SSH do CIDR
+administrativo; MySQL, RabbitMQ e APIs ficam na rede Docker.
+
+Os limites de memoria/heap e o swap permitem uma configuracao enxuta, mas
+**nao houve validacao de carga nem deploy desta alternativa**. Pode haver
+lentidao, OOM e indisponibilidade total; nenhuma disponibilidade e prometida.
+O modo de creditos CPU `standard` evita sobretaxa de burst, mas limita CPU
+apos consumir os creditos. Use `t3a.medium` se os servicos nao couberem na
+memoria; isso altera o custo. ARM nao foi escolhido porque as imagens atuais
+sao x86 e sua compatibilidade ARM nao foi confirmada. Nao usa Spot: a
+cotacao varia e nao ha garantia de capacidade para religar diariamente.
+
+### Horario e persistencia
+
+Duas regras EventBridge chamam uma Lambda para ligar a EC2 as **06h** e
+desligar as **22h**, todos os dias, horario de Brasilia (UTC-3). Os crons sao
+09h e 01h UTC, respectivamente. Isso inicia a maquina as 06h, nao garante a
+aplicacao pronta nesse horario. Se o fuso mudar, ajuste os crons. Para
+suspender o agendamento, use `ScheduleState=DISABLED`.
+No deploy inicial, a EC2 inicia imediatamente, mesmo fora desse intervalo;
+pare-a manualmente depois da criacao se necessario.
+
+O agendamento reutiliza `LabRole` (`AutomationRoleName`), sem criar IAM.
+Essa role precisa confiar em `lambda.amazonaws.com` e permitir
+`ec2:StartInstances`, `ec2:StopInstances` na EC2 criada e escrita de logs.
+A identidade do deploy precisa de `iam:PassRole` e de permissoes para
+CloudFormation, EC2, Lambda, EventBridge e leitura do parametro publico SSM
+da AMI. O template **nao concede** permissoes ausentes no laboratorio.
+Falhas da Lambda aparecem nos logs `/aws/lambda/<nome-da-funcao>`;
+sem permissao de stop, a EC2 continua ligada e a estimativa de 16h nao vale.
+Ao excluir a stack, esse log group pode permanecer e continuar armazenando
+logs; ele nao e gerenciado por este template.
+
+Os containers usam `restart: unless-stopped`; os volumes MySQL/RabbitMQ
+persistem no disco entre stop/start. **Excluir/substituir a EC2 exclui o
+disco e todos os dados**. Nao existe migracao automatica do banco atual:
+esta alternativa importa a mesma base SQL inicial e configura a senha de
+`admin@teste.com`. Faca exportacao/importacao manual para preservar dados
+existentes. Atualizacoes de `UserData`, senhas ou tag de imagem nao
+reconfiguram automaticamente uma maquina ja inicializada.
+
+Nao ha Elastic IP para evitar cobranca nas oito horas desligadas. O IPv4
+publico muda a cada start; os Outputs registram o endereco do momento da
+criacao e podem ficar desatualizados. Consulte o endereco atual usando o
+`InstanceId` retornado:
+
+```powershell
+aws ec2 describe-instances --instance-ids i-EXEMPLO --region us-east-1 `
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
+```
+
+### Criacao
+
+Crie uma **nova stack**, por exemplo `codetracker-economico`, pelo console
+CloudFormation, enviando `cloudformationCodeTracker-economica.yaml`.
+Use `us-east-1` para corresponder a estimativa. Informe `KeyName`,
+`SshAllowedCidr` (seu IPv4/32), as senhas MySQL/RabbitMQ/admin,
+`JwtSecret`, SMTP e destinatario. Os demais parametros ja possuem defaults.
+Gere `JwtSecret` com o mesmo comando descrito no template principal.
+As imagens publicas e o SQL sao os mesmos usados pela infraestrutura atual.
+Confira `CREATE_COMPLETE` e, na EC2, `/var/log/cloud-init-output.log` em caso
+de falha. Credenciais ficam em arquivos de acesso restrito no host e sao
+montadas como secrets Compose; `NoEcho` nao criptografa o UserData.
+O site continua em HTTP, como na stack atual.
+
+### Estimativa com o c3x instalado
+
+O comparativo reproduzivel esta em
+[`custos-economica/comparacao.md`](custos-economica/comparacao.md), com
+JSONs brutos do c3x e detalhamento dos ajustes. Para um mes de 30 dias em
+`us-east-1`, com todas as EC2 ligadas 16h/dia:
+
+| Stack | Base mensal estimada (USD) |
+| --- | ---: |
+| Atual: oito EC2, dois NATs e ALB | 187.69 |
+| Economica: uma EC2 com os cinco servicos | 13.02 |
+
+Economia aproximada de **93.06% (USD 174.67/mes)**. Sao valores base, sem
+trafego, processamento NAT, LCUs, logs, backups, impostos ou creditos.
+Data lake e observabilidade ficam fora dos dois cenarios. Nenhum recurso
+AWS foi criado para obter esses valores.
+
+**Nao multiplique o custo total por 16/24:** NAT e ALB nao possuem stop,
+EIPs continuam alocados, e EBS e cobrado durante o mes inteiro.
+O custo atual pressupoe stop/start externo das oito EC2; o template atual
+nao implementa esse agendamento. O script ajusta os 730h padrao do c3x
+para 480h de EC2 e 720h de NAT/ALB/EIP. Acrescenta discos raiz nao
+declarados (premissa: oito discos de 8 GB gp3), IPv4 omitidos e corrige a
+tarifa de zona privada do Route 53 retornada pelo c3x 0.3.21. O disco de
+20 GB da versao economica esta declarado e e cobrado apenas uma vez.
+
+Execute no PowerShell com Python e PyYAML (ou `uv run --no-project --with
+pyyaml python` no lugar de `py`):
+
+```powershell
+py "IaC CloudFormation\estimar-custos.py" `
+  --c3x "C:\Users\Guilherme\Downloads\c3x_0.3.21_windows_amd64\c3x.exe" `
+  --region us-east-1 --days 30 --original-root-gb 8
+```
+
+O script nao consulta credenciais AWS nem faz deploy; somente o c3x consulta
+tarifas publicas. Verifique na conta/AMI o tamanho real dos discos raiz
+atuais e ajuste `--original-root-gb`. `--days` aceita 28 a 31 dias.
+Os resultados sao regenerados em `custos-economica`; a tabela acima e uma
+fotografia da consulta, nao uma promessa de preco.
+Contratos offline (requerem PyYAML, Bash e Docker Compose; no Windows usam Ubuntu/WSL):
+`py -m unittest discover -s "IaC CloudFormation\tests" -p economical_infrastructure_test.py`.
+
 ## Data lake (stack independente)
 
 O template `buckets+lambda.yml` cria buckets privados Bronze, Silver, Gold e

@@ -1,0 +1,392 @@
+{
+  "costs": [
+    {
+      "resource": "aws_eip.NatEipAz2",
+      "kind": "aws_eip",
+      "name": "NatEipAz2",
+      "line_items": [
+        {
+          "dimension": "ip_hours",
+          "description": "Public IPv4 address-hour",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.005",
+          "monthly_cost": "3.65",
+          "price_source": "static"
+        }
+      ],
+      "monthly_subtotal": "3.65",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_ebs_volume.DatabaseDataVolume",
+      "kind": "aws_ebs_volume",
+      "name": "DatabaseDataVolume",
+      "line_items": [
+        {
+          "dimension": "storage",
+          "description": "Storage",
+          "unit": "GB-month",
+          "quantity": "20",
+          "unit_rate": "0.08",
+          "monthly_cost": "1.6",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "1.6",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.DatabaseStandbyInstance",
+      "kind": "aws_instance",
+      "name": "DatabaseStandbyInstance",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0104",
+          "monthly_cost": "7.592",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "7.59",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.WebInstanceAz1",
+      "kind": "aws_instance",
+      "name": "WebInstanceAz1",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0104",
+          "monthly_cost": "7.592",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "7.59",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_eip.BastionEip",
+      "kind": "aws_eip",
+      "name": "BastionEip",
+      "line_items": [
+        {
+          "dimension": "ip_hours",
+          "description": "Public IPv4 address-hour",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.005",
+          "monthly_cost": "3.65",
+          "price_source": "static"
+        }
+      ],
+      "monthly_subtotal": "3.65",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_nat_gateway.NatGatewayAz2",
+      "kind": "aws_nat_gateway",
+      "name": "NatGatewayAz2",
+      "line_items": [
+        {
+          "dimension": "gateway_hours",
+          "description": "Gateway",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.045",
+          "monthly_cost": "32.85",
+          "price_source": "live"
+        },
+        {
+          "dimension": "data_processing",
+          "description": "Data processed",
+          "unit": "GB",
+          "quantity": "0",
+          "unit_rate": "0.045",
+          "monthly_cost": "0",
+          "price_source": "live",
+          "caveats": [
+            {
+              "code": "usage_not_provided",
+              "detail": "no usage provided for monthly_data_processed_gb; set it in a usage file (--usage) to price this line"
+            }
+          ]
+        }
+      ],
+      "monthly_subtotal": "32.85",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_nat_gateway.NatGatewayAz1",
+      "kind": "aws_nat_gateway",
+      "name": "NatGatewayAz1",
+      "line_items": [
+        {
+          "dimension": "gateway_hours",
+          "description": "Gateway",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.045",
+          "monthly_cost": "32.85",
+          "price_source": "live"
+        },
+        {
+          "dimension": "data_processing",
+          "description": "Data processed",
+          "unit": "GB",
+          "quantity": "0",
+          "unit_rate": "0.045",
+          "monthly_cost": "0",
+          "price_source": "live",
+          "caveats": [
+            {
+              "code": "usage_not_provided",
+              "detail": "no usage provided for monthly_data_processed_gb; set it in a usage file (--usage) to price this line"
+            }
+          ]
+        }
+      ],
+      "monthly_subtotal": "32.85",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.BastionInstance",
+      "kind": "aws_instance",
+      "name": "BastionInstance",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0208",
+          "monthly_cost": "15.184",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "15.18",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_lb_target_group.WebTargetGroup",
+      "kind": "aws_lb_target_group",
+      "name": "WebTargetGroup",
+      "line_items": [
+        {
+          "dimension": "free",
+          "description": "Target group (no charge \u00e2\u20ac\u201d billed via parent load balancer)",
+          "unit": "n/a",
+          "quantity": "0",
+          "unit_rate": "0",
+          "monthly_cost": "0",
+          "price_source": "static"
+        }
+      ],
+      "monthly_subtotal": "0",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.WebInstanceAz2",
+      "kind": "aws_instance",
+      "name": "WebInstanceAz2",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0104",
+          "monthly_cost": "7.592",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "7.59",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.SwarmManagerInstance",
+      "kind": "aws_instance",
+      "name": "SwarmManagerInstance",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0208",
+          "monthly_cost": "15.184",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "15.18",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_lb.ApplicationLoadBalancer",
+      "kind": "aws_lb",
+      "name": "ApplicationLoadBalancer",
+      "line_items": [
+        {
+          "dimension": "lb_hours",
+          "description": "Load balancer",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0225",
+          "monthly_cost": "16.425",
+          "price_source": "live"
+        },
+        {
+          "dimension": "lcu_hours",
+          "description": "Load balancer capacity units",
+          "unit": "LCU-hours",
+          "quantity": "0",
+          "unit_rate": "0.008",
+          "monthly_cost": "0",
+          "price_source": "live",
+          "caveats": [
+            {
+              "code": "usage_not_provided",
+              "detail": "no usage provided for monthly_lcu_hours; set it in a usage file (--usage) to price this line"
+            }
+          ]
+        }
+      ],
+      "monthly_subtotal": "16.43",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.BackendInstanceAz2",
+      "kind": "aws_instance",
+      "name": "BackendInstanceAz2",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0416",
+          "monthly_cost": "30.368",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "30.37",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_ebs_volume.DatabaseStandbyDataVolume",
+      "kind": "aws_ebs_volume",
+      "name": "DatabaseStandbyDataVolume",
+      "line_items": [
+        {
+          "dimension": "storage",
+          "description": "Storage",
+          "unit": "GB-month",
+          "quantity": "20",
+          "unit_rate": "0.08",
+          "monthly_cost": "1.6",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "1.6",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.DatabaseInstance",
+      "kind": "aws_instance",
+      "name": "DatabaseInstance",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0104",
+          "monthly_cost": "7.592",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "7.59",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_eip.NatEipAz1",
+      "kind": "aws_eip",
+      "name": "NatEipAz1",
+      "line_items": [
+        {
+          "dimension": "ip_hours",
+          "description": "Public IPv4 address-hour",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.005",
+          "monthly_cost": "3.65",
+          "price_source": "static"
+        }
+      ],
+      "monthly_subtotal": "3.65",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_route53_zone.DatabasePrivateHostedZone",
+      "kind": "aws_route53_zone",
+      "name": "DatabasePrivateHostedZone",
+      "line_items": [
+        {
+          "dimension": "hosted_zone",
+          "description": "Hosted zone",
+          "unit": "zones",
+          "quantity": "1",
+          "unit_rate": "0.0005",
+          "monthly_cost": "0.0005",
+          "price_source": "live"
+        },
+        {
+          "dimension": "queries",
+          "description": "DNS queries",
+          "unit": "queries",
+          "quantity": "0",
+          "unit_rate": "0.0000006",
+          "monthly_cost": "0",
+          "price_source": "live",
+          "caveats": [
+            {
+              "code": "usage_not_provided",
+              "detail": "no usage provided for monthly_queries; set it in a usage file (--usage) to price this line"
+            }
+          ]
+        }
+      ],
+      "monthly_subtotal": "0",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_instance.BackendInstanceAz1",
+      "kind": "aws_instance",
+      "name": "BackendInstanceAz1",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0416",
+          "monthly_cost": "30.368",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "30.37",
+      "currency": "USD"
+    }
+  ],
+  "project_total": "217.74",
+  "currency": "USD",
+  "generated_at": "2026-11-02T22:01:21Z",
+  "caveat_count": 4
+}

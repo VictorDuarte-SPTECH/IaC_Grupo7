@@ -1,0 +1,10 @@
+﻿{
+    "template":  "buckets+lambda.yml",
+    "executedAt":  "2026-10-29 14:16:43 -03:00",
+    "exitCode":  1,
+    "completed":  false,
+    "timedOut":  false,
+    "authenticationRequired":  true,
+    "currency":  "USD",
+    "log":  "C:\\Users\\Guilherme\\Desktop\\Projeto de extenção\\IaC_Grupo7\\IaC CloudFormation\\finops\\resultados\\datalake.log"
+}

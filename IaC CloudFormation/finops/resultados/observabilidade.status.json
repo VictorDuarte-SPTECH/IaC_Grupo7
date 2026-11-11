@@ -1,0 +1,10 @@
+﻿{
+    "template":  "observabilidade-ti.yaml",
+    "executedAt":  "2026-10-29 14:17:31 -03:00",
+    "exitCode":  1,
+    "completed":  false,
+    "timedOut":  false,
+    "authenticationRequired":  true,
+    "currency":  "USD",
+    "log":  "C:\\Users\\Guilherme\\Desktop\\Projeto de extenção\\IaC_Grupo7\\IaC CloudFormation\\finops\\resultados\\observabilidade.log"
+}

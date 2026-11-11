@@ -1,0 +1,74 @@
+{
+  "costs": [
+    {
+      "resource": "aws_instance.ApplicationInstance",
+      "kind": "aws_instance",
+      "name": "ApplicationInstance",
+      "line_items": [
+        {
+          "dimension": "compute_hours",
+          "description": "Instance usage (Linux/UNIX, on-demand)",
+          "unit": "hours",
+          "quantity": "730",
+          "unit_rate": "0.0188",
+          "monthly_cost": "13.724",
+          "price_source": "live"
+        },
+        {
+          "dimension": "root_volume",
+          "description": "Root EBS volume",
+          "unit": "GB-month",
+          "quantity": "20",
+          "unit_rate": "0.08",
+          "monthly_cost": "1.6",
+          "price_source": "live"
+        }
+      ],
+      "monthly_subtotal": "15.32",
+      "currency": "USD"
+    },
+    {
+      "resource": "aws_lambda_function.ScheduleFunction",
+      "kind": "aws_lambda_function",
+      "name": "ScheduleFunction",
+      "line_items": [
+        {
+          "dimension": "requests",
+          "description": "Requests",
+          "unit": "requests",
+          "quantity": "0",
+          "unit_rate": "0.0000002",
+          "monthly_cost": "0",
+          "price_source": "live",
+          "caveats": [
+            {
+              "code": "usage_not_provided",
+              "detail": "no usage provided for monthly_requests; set it in a usage file (--usage) to price this line"
+            }
+          ]
+        },
+        {
+          "dimension": "duration",
+          "description": "Duration",
+          "unit": "GB-seconds",
+          "quantity": "0",
+          "unit_rate": "0.0000166667",
+          "monthly_cost": "0",
+          "price_source": "live",
+          "caveats": [
+            {
+              "code": "usage_not_provided",
+              "detail": "no usage provided for monthly_requests, request_duration_ms; set it in a usage file (--usage) to price this line"
+            }
+          ]
+        }
+      ],
+      "monthly_subtotal": "0",
+      "currency": "USD"
+    }
+  ],
+  "project_total": "15.32",
+  "currency": "USD",
+  "generated_at": "2026-11-02T22:01:21Z",
+  "caveat_count": 2
+}

@@ -1,0 +1,407 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CodeTracker economico: uma EC2 x86 com Docker Compose, MySQL, RabbitMQ,
+  backend, etiquetas e frontend. Sem alta disponibilidade. Liga as 06h
+  e desliga as 22h de Brasilia todos os dias.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: codetracker-economico
+    AllowedPattern: '[a-zA-Z0-9][a-zA-Z0-9-]{0,24}'
+  InstanceType:
+    Type: String
+    Default: t3a.small
+    AllowedValues: [t3a.small, t3.small, t3a.medium, t3.medium]
+    Description: Minimo de 2 GiB para os cinco containers; nao usar AMI ARM.
+  UbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  SshAllowedCidr:
+    Type: String
+    Description: IPv4 administrativo com mascara, preferencialmente seu IP/32.
+    AllowedPattern: '(\d{1,3}\.){3}\d{1,3}/\d{1,2}'
+  AutomationRoleName:
+    Type: String
+    Default: LabRole
+    Description: Role existente assumivel por Lambda, com StartInstances, StopInstances e logs.
+    AllowedPattern: '[a-zA-Z0-9+=,.@_-]+'
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+  DockerHubNamespace:
+    Type: String
+    Default: guilhermebarros297
+    AllowedPattern: '[a-z0-9][a-z0-9_-]*'
+  ApplicationImageTag:
+    Type: String
+    Default: v1.0.1
+    AllowedPattern: '[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}'
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+  RabbitMqUser:
+    Type: String
+    Default: lamar
+    AllowedPattern: '[a-zA-Z0-9_-]+'
+  RabbitMqPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Description: Senha inicial de admin@teste.com, nao e a senha MySQL.
+    MinLength: 12
+    MaxLength: 72
+    AllowedPattern: '[a-zA-Z0-9._~!@#%^+=-]+'
+  JwtSecret:
+    Type: String
+    NoEcho: true
+    MinLength: 44
+    AllowedPattern: '[a-zA-Z0-9+/]+={0,2}'
+  MailUsername:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+  MailPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 1
+  EtiquetaEmailDestinatario:
+    Type: String
+    AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/24
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.20.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP publico e SSH apenas do administrador
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SshAllowedCidr
+  ApplicationInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: [PublicDefaultRoute, PublicRouteTableAssociation]
+    Properties:
+      ImageId: !Ref UbuntuAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      CreditSpecification:
+        CPUCredits: standard
+      MetadataOptions:
+        HttpTokens: required
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: '0'
+          SubnetId: !Ref PublicSubnet
+          GroupSet: [!Ref ApplicationSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-app'
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -Eeuo pipefail
+            umask 077
+            signal_result() {
+              status=$?
+              trap - EXIT
+              result=FAILURE
+              if [ "$status" -eq 0 ]; then result=SUCCESS; fi
+              curl --fail --silent --show-error --retry 3 \
+                --connect-timeout 10 --max-time 30 --request PUT \
+                --header 'Content-Type:' \
+                --data-binary "{\"Status\":\"$result\",\"Reason\":\"Consulte /var/log/cloud-init-output.log\",\"UniqueId\":\"ApplicationInstance\",\"Data\":\"bootstrap\"}" \
+                '${SignalHandle}' || exit 1
+              exit "$status"
+            }
+            trap signal_result EXIT
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y docker.io docker-compose-v2 git apache2-utils python3 curl ca-certificates
+            systemctl enable --now docker
+            usermod -aG docker ubuntu
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            mkdir -p /opt/codetracker/secrets /opt/codetracker/init
+            cd /opt/codetracker
+            printf '%s' '${DatabasePassword}' > secrets/DB_PASSWORD
+            printf '%s' '${RabbitMqPassword}' > secrets/spring.rabbitmq.password
+            printf '%s' '${JwtSecret}' > secrets/JWT_SECRET
+            printf '%s' '${MailPasswordBase64}' | base64 --decode \
+              | python3 -c 'import sys; v = sys.stdin.buffer.read(); gmail = sys.argv[1].lower().endswith(("@gmail.com", "@googlemail.com")); sys.stdout.buffer.write(v.replace(b" ", b"") if gmail else v)' '${MailUsername}' \
+              > secrets/MAIL_PASSWORD
+            printf '[client]\nuser=root\npassword="%s"\n' '${DatabasePassword}' > secrets/mysql.cnf
+            git clone --depth 1 https://github.com/EnzoServilha/Banco_Grupo7.git banco
+            cp banco/SCRIPT-Lamar-AutoPecas.sql init/01-schema.sql
+            cat > compose.yaml <<'COMPOSE'
+            services:
+              mysql:
+                image: mysql:8.4
+                restart: unless-stopped
+                mem_limit: 384m
+                memswap_limit: 768m
+                command: [--innodb-buffer-pool-size=64M, --max-connections=30, --performance-schema=OFF]
+                environment:
+                  MYSQL_ROOT_PASSWORD_FILE: /run/secrets/DB_PASSWORD
+                  MYSQL_DATABASE: lamar
+                secrets: [DB_PASSWORD, mysql.cnf]
+                volumes:
+                  - mysql_data:/var/lib/mysql
+                  - ./init:/docker-entrypoint-initdb.d:ro
+                healthcheck:
+                  test: [CMD-SHELL, "mysql --defaults-extra-file=/run/secrets/mysql.cnf --protocol=TCP -h 127.0.0.1 -e 'SELECT 1'"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 60
+                  start_period: 60s
+              rabbitmq:
+                image: rabbitmq:4-alpine
+                hostname: rabbitmq
+                restart: unless-stopped
+                mem_limit: 256m
+                memswap_limit: 512m
+                entrypoint: [/bin/sh, -ec]
+                command:
+                  - |
+                    export RABBITMQ_DEFAULT_PASS="$$(cat /run/secrets/spring.rabbitmq.password)"
+                    exec docker-entrypoint.sh rabbitmq-server
+                environment:
+                  RABBITMQ_DEFAULT_USER: '${RabbitMqUser}'
+                  RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: '-rabbit vm_memory_high_watermark {absolute,134217728}'
+                secrets: [spring.rabbitmq.password]
+                volumes: [rabbitmq_data:/var/lib/rabbitmq]
+                healthcheck:
+                  test: [CMD, rabbitmq-diagnostics, -q, ping]
+                  interval: 15s
+                  timeout: 10s
+                  retries: 20
+              backend:
+                image: ${DockerHubNamespace}/codetracker-backend:${ApplicationImageTag}
+                restart: unless-stopped
+                mem_limit: 512m
+                memswap_limit: 768m
+                environment:
+                  DB_HOST: mysql
+                  DB_NAME: lamar
+                  DB_USERNAME: lamar
+                  SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
+                  SPRING_RABBITMQ_ADDRESSES: 'rabbitmq:5672'
+                  SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
+                  SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE: '5'
+                  JAVA_TOOL_OPTIONS: '-Xms64m -Xmx256m -XX:ActiveProcessorCount=2'
+                  MAIL_USERNAME: '${MailUsername}'
+                secrets: [DB_PASSWORD, spring.rabbitmq.password, JWT_SECRET, MAIL_PASSWORD]
+                depends_on:
+                  mysql: {condition: service_healthy}
+                  rabbitmq: {condition: service_healthy}
+              etiquetas:
+                image: ${DockerHubNamespace}/codetracker-etiquetas:${ApplicationImageTag}
+                restart: unless-stopped
+                mem_limit: 384m
+                memswap_limit: 640m
+                environment:
+                  BACKEND_API_BASE_URL: 'http://backend:8080'
+                  DB_HOST: mysql
+                  DB_NAME: lamar
+                  DB_USERNAME: lamar
+                  SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
+                  SPRING_JPA_HIBERNATE_DDL_AUTO: update
+                  SPRING_RABBITMQ_ADDRESSES: 'rabbitmq:5672'
+                  SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
+                  SPRING_DATASOURCE_HIKARI_MAXIMUMPOOLSIZE: '3'
+                  JAVA_TOOL_OPTIONS: '-Xms32m -Xmx192m -XX:ActiveProcessorCount=2'
+                  MAIL_USERNAME: '${MailUsername}'
+                  ETIQUETA_EMAIL_DESTINATARIO: '${EtiquetaEmailDestinatario}'
+                secrets: [DB_PASSWORD, spring.rabbitmq.password, MAIL_PASSWORD]
+                depends_on:
+                  mysql: {condition: service_healthy}
+                  rabbitmq: {condition: service_healthy}
+                  backend: {condition: service_started}
+              frontend:
+                image: ${DockerHubNamespace}/codetracker-frontend:${ApplicationImageTag}
+                restart: unless-stopped
+                mem_limit: 64m
+                memswap_limit: 128m
+                ports: ['80:80']
+                depends_on: [backend, etiquetas]
+            volumes:
+              mysql_data:
+              rabbitmq_data:
+            secrets:
+              DB_PASSWORD: {file: ./secrets/DB_PASSWORD}
+              spring.rabbitmq.password: {file: ./secrets/spring.rabbitmq.password}
+              JWT_SECRET: {file: ./secrets/JWT_SECRET}
+              MAIL_PASSWORD: {file: ./secrets/MAIL_PASSWORD}
+              mysql.cnf: {file: ./secrets/mysql.cnf}
+            COMPOSE
+            # Secrets Compose sao bind mounts; as JVMs executam com usuario nao root.
+            chmod 0444 secrets/DB_PASSWORD secrets/spring.rabbitmq.password secrets/JWT_SECRET secrets/MAIL_PASSWORD
+            chmod 0755 init
+            chmod 0644 init/01-schema.sql
+            docker compose up -d --wait --wait-timeout 900 mysql rabbitmq
+            docker compose exec -T mysql mysql --defaults-extra-file=/run/secrets/mysql.cnf <<'SQL'
+            CREATE USER IF NOT EXISTS 'lamar'@'%' IDENTIFIED BY '${DatabasePassword}';
+            ALTER USER 'lamar'@'%' IDENTIFIED BY '${DatabasePassword}';
+            GRANT ALL PRIVILEGES ON lamar.* TO 'lamar'@'%';
+            SQL
+            ADMIN_HASH=$(printf '%s\n' '${AdminPassword}' | htpasswd -niB -C 10 admin | cut -d: -f2-)
+            UPDATED_ADMIN=$(docker compose exec -T mysql mysql --defaults-extra-file=/run/secrets/mysql.cnf --database=lamar --batch --skip-column-names <<SQL
+            UPDATE usuario SET senha = '$ADMIN_HASH'
+            WHERE email = 'admin@teste.com' AND ativo = 1
+              AND permissao_id = (SELECT id FROM permissao WHERE nome = 'ROLE_ADMIN');
+            SELECT ROW_COUNT();
+            SQL
+            )
+            if [ "$UPDATED_ADMIN" != 1 ]; then
+              echo 'Administrador inicial nao encontrado no SQL importado.' >&2
+              exit 1
+            fi
+            unset ADMIN_HASH
+            docker compose up -d --wait --wait-timeout 300
+            curl --fail --retry 12 --retry-connrefused --retry-delay 5 http://localhost/
+          - MailPasswordBase64: !Base64 {Ref: MailPassword}
+            SignalHandle: !Ref BootstrapSignalHandle
+  BootstrapSignalHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  BootstrapWaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    Properties:
+      Handle: !Ref BootstrapSignalHandle
+      Timeout: '1800'
+      Count: 1
+  ScheduleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AutomationRoleName}'
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref ApplicationInstance
+      Code:
+        ZipFile: |
+          import logging
+          import os
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ec2 = boto3.client("ec2")
+
+          def handler(event, context):
+              action = event["action"]
+              instance_id = os.environ["INSTANCE_ID"]
+              logger.info("EC2 action=%s instance=%s", action, instance_id)
+              if action == "start":
+                  return ec2.start_instances(InstanceIds=[instance_id])
+              if action == "stop":
+                  return ec2.stop_instances(InstanceIds=[instance_id])
+              raise ValueError("Invalid EC2 schedule action: " + str(action))
+  StartRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 06h Brasilia (UTC-3), todos os dias; cron EventBridge usa UTC.
+      ScheduleExpression: cron(0 9 * * ? *)
+      State: !Ref ScheduleState
+      Targets:
+        - Id: StartInstance
+          Arn: !GetAtt ScheduleFunction.Arn
+          Input: '{"action":"start"}'
+  StopRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 22h Brasilia (UTC-3), todos os dias; 01h UTC do dia seguinte.
+      ScheduleExpression: cron(0 1 * * ? *)
+      State: !Ref ScheduleState
+      Targets:
+        - Id: StopInstance
+          Arn: !GetAtt ScheduleFunction.Arn
+          Input: '{"action":"stop"}'
+  StartPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ScheduleFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StartRule.Arn
+  StopPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ScheduleFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StopRule.Arn
+
+Outputs:
+  InstanceId:
+    Value: !Ref ApplicationInstance
+  ApplicationUrlAtCreation:
+    Description: IPv4 dinamico; consulte novamente a EC2 depois de cada start.
+    Value: !Sub 'http://${ApplicationInstance.PublicIp}'
+  SshCommandAtCreation:
+    Value: !Sub 'ssh -i "${KeyName}.pem" ubuntu@${ApplicationInstance.PublicIp}'
+  Schedule:
+    Value: 'Todos os dias: start 06:00, stop 22:00 America/Sao_Paulo (UTC-3).'
