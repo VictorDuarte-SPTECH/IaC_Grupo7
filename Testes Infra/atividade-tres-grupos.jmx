@@ -1,0 +1,542 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0" jmeter="5.6.3">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan" testname="CodeTracker - Tres grupos pelo ALB">
+      <stringProp name="TestPlan.comments">ALB HTTP 80, API em /api. Grupos sequenciais 2/20/100 usuarios por 300s. Jornadas das telas Dashboard, Pecas, Periodos e Pedidos. -Jnavegacao=diferentes (padrao) alterna telas/registros; mesmo usa -Jtela=pecas|dashboard|periodos|pedidos. Login seguido do Dashboard, como no frontend. Informe host e JMETER_PASSWORD. Apenas leitura. Consulte README.md, inclusive divergencias de contrato e fan-out do catalogo.</stringProp>
+      <boolProp name="TestPlan.serialize_threadgroups">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments" guiclass="ArgumentsPanel" testclass="Arguments" testname="Destino ALB">
+        <collectionProp name="Arguments.arguments">
+          <elementProp name="host" elementType="Argument">
+            <stringProp name="Argument.name">host</stringProp>
+            <stringProp name="Argument.value">${__P(host,lamar-auto-pecas-alb-1239953831.us-east-1.elb.amazonaws.com)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="protocolo" elementType="Argument">
+            <stringProp name="Argument.name">protocolo</stringProp>
+            <stringProp name="Argument.value">${__P(protocolo,http)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="porta" elementType="Argument">
+            <stringProp name="Argument.name">porta</stringProp>
+            <stringProp name="Argument.value">${__P(porta,80)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+          <elementProp name="email" elementType="Argument">
+            <stringProp name="Argument.name">email</stringProp>
+            <stringProp name="Argument.value">${__P(email,admin@teste.com)}</stringProp>
+            <stringProp name="Argument.metadata">=</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+      <ConfigTestElement guiclass="HttpDefaultsGui" testclass="ConfigTestElement" testname="ALB - Todas as requisicoes usam este destino">
+        <stringProp name="HTTPSampler.connect_timeout">${__P(timeout_conexao_ms,5000)}</stringProp>
+        <stringProp name="HTTPSampler.response_timeout">${__P(timeout_resposta_ms,10000)}</stringProp>
+        <stringProp name="HTTPSampler.domain">${host}</stringProp>
+        <stringProp name="HTTPSampler.port">${porta}</stringProp>
+        <stringProp name="HTTPSampler.protocol">${protocolo}</stringProp>
+        <stringProp name="HTTPSampler.contentEncoding">UTF-8</stringProp>
+        <elementProp name="HTTPsampler.Arguments" elementType="Arguments" guiclass="HTTPArgumentsPanel" testclass="Arguments" testname="Variáveis Definidas Pelo Usuário">
+          <collectionProp name="Arguments.arguments"/>
+        </elementProp>
+        <stringProp name="HTTPSampler.implementation">HttpClient4</stringProp>
+      </ConfigTestElement>
+      <hashTree/>
+      <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Identificar a carga nos logs" enabled="true">
+        <collectionProp name="HeaderManager.headers">
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">Accept</stringProp>
+            <stringProp name="Header.value">application/json</stringProp>
+          </elementProp>
+          <elementProp name="" elementType="Header">
+            <stringProp name="Header.name">User-Agent</stringProp>
+            <stringProp name="Header.value">CodeTracker-JMeter/${__P(rodada,manual)}</stringProp>
+          </elementProp>
+        </collectionProp>
+      </HeaderManager>
+      <hashTree/>
+      <SetupThreadGroup guiclass="SetupThreadGroupGui" testclass="SetupThreadGroup" testname="Pre-validacao local - sem carga HTTP" enabled="true">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">stoptestnow</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <stringProp name="LoopController.loops">1</stringProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </SetupThreadGroup>
+      <hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="Configuracao - Validar antes de acessar o ALB" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="script">
+def erros = []
+if (!(vars.get(&apos;host&apos;) ==~ /[a-zA-Z0-9][a-zA-Z0-9.-]*/)) {
+    erros.add(&apos;Informe -Jhost com o DNS do ALB, sem protocolo, porta ou caminho.&apos;)
+}
+if (!(vars.get(&apos;protocolo&apos;) in [&apos;http&apos;, &apos;https&apos;])) erros.add(&apos;Protocolo deve ser http ou https.&apos;)
+if (!vars.get(&apos;email&apos;)?.trim()) erros.add(&apos;Informe -Jemail com uma conta de teste ativa.&apos;)
+if (!System.getenv(&apos;JMETER_PASSWORD&apos;)) erros.add(&apos;Defina a variavel de ambiente JMETER_PASSWORD.&apos;)
+def grupo = props.getProperty(&apos;grupo&apos;, &apos;todos&apos;)
+if (!(grupo in [&apos;todos&apos;, &apos;2&apos;, &apos;20&apos;, &apos;100&apos;])) erros.add(&apos;grupo deve ser todos, 2, 20 ou 100.&apos;)
+if (!(props.getProperty('navegacao', 'diferentes') in ['mesmo', 'diferentes'])) erros.add('navegacao deve ser mesmo ou diferentes.')
+if (!(props.getProperty('tela', 'pecas') in ['dashboard', 'pecas', 'periodos', 'pedidos'])) erros.add('tela deve ser dashboard, pecas, periodos ou pedidos.')
+def limites = [
+    porta: [80, 1, 65535], duracao_s: [300, 2, 86400],
+    rampa_2_s: [2, 1, 86399], rampa_20_s: [20, 1, 86399], rampa_100_s: [60, 1, 86399],
+    pausa_ms: [500, 0, 60000], variacao_ms: [500, 0, 60000],
+    limite_resposta_ms: [5000, 1, 600000],
+    timeout_conexao_ms: [5000, 1, 600000], timeout_resposta_ms: [10000, 1, 600000]
+]
+def valores = [:]
+limites.each { chave, faixa -&gt;
+    def texto = props.getProperty(chave, faixa[0].toString())
+    if (!(texto ==~ /[0-9]{1,9}/) || texto.toLong() &lt; faixa[1] || texto.toLong() &gt; faixa[2]) {
+        erros.add(&quot;Parametro ${chave} deve ser inteiro entre ${faixa[1]} e ${faixa[2]}.&quot;)
+    } else {
+        valores[chave] = texto.toInteger()
+    }
+}
+[&apos;2&apos;, &apos;20&apos;, &apos;100&apos;].each { n -&gt;
+    if (grupo in [&apos;todos&apos;, n] &amp;&amp; valores.duracao_s != null &amp;&amp;
+            valores[&quot;rampa_${n}_s&quot;.toString()] != null &amp;&amp;
+            valores.duracao_s &lt;= valores[&quot;rampa_${n}_s&quot;.toString()]) {
+        erros.add(&quot;duracao_s deve ser maior que rampa_${n}_s.&quot;)
+    }
+}
+if (erros) {
+    def mensagem = erros.join(&apos; &apos;)
+    log.error(mensagem)
+    SampleResult.setSuccessful(false)
+    SampleResult.setResponseCode(&apos;CONFIG&apos;)
+    SampleResult.setResponseMessage(mensagem)
+    SampleResult.setStopTestNow(true)
+    return
+}
+[&apos;2&apos;, &apos;20&apos;, &apos;100&apos;].each { n -&gt; props.setProperty(&apos;exec.usuarios_&apos; + n, grupo in [&apos;todos&apos;, n] ? n : &apos;0&apos;) }
+SampleResult.setResponseCode(&apos;200&apos;)
+SampleResult.setResponseMessage(&apos;Parametros validos; nenhuma requisicao externa nesta etapa.&apos;)
+SampleResult.setSuccessful(true)
+</stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="filename"></stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="G1 - 2 usuarios" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${__P(exec.usuarios_2,0)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampa_2_s,2)}</stringProp>
+        <stringProp name="ThreadGroup.duration">${__P(duracao_s,300)}</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <intProp name="LoopController.loops">-1</intProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <ModuleController guiclass="ModuleControllerGui" testclass="ModuleController" testname="Executar fluxo autenticado" enabled="true">
+          <collectionProp name="ModuleController.node_path">
+            <stringProp name="raiz">Test Plan</stringProp>
+            <stringProp name="plano">CodeTracker - Tres grupos pelo ALB</stringProp>
+            <stringProp name="fluxo">Fluxo compartilhado - API pelo ALB</stringProp>
+          </collectionProp>
+        </ModuleController>
+        <hashTree/>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="G2 - 20 usuarios" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${__P(exec.usuarios_20,0)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampa_20_s,20)}</stringProp>
+        <stringProp name="ThreadGroup.duration">${__P(duracao_s,300)}</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <intProp name="LoopController.loops">-1</intProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <ModuleController guiclass="ModuleControllerGui" testclass="ModuleController" testname="Executar fluxo autenticado" enabled="true">
+          <collectionProp name="ModuleController.node_path">
+            <stringProp name="raiz">Test Plan</stringProp>
+            <stringProp name="plano">CodeTracker - Tres grupos pelo ALB</stringProp>
+            <stringProp name="fluxo">Fluxo compartilhado - API pelo ALB</stringProp>
+          </collectionProp>
+        </ModuleController>
+        <hashTree/>
+      </hashTree>
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup" testname="G3 - 100 usuarios" enabled="true">
+        <stringProp name="ThreadGroup.num_threads">${__P(exec.usuarios_100,0)}</stringProp>
+        <stringProp name="ThreadGroup.ramp_time">${__P(rampa_100_s,60)}</stringProp>
+        <stringProp name="ThreadGroup.duration">${__P(duracao_s,300)}</stringProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <boolProp name="ThreadGroup.scheduler">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController" guiclass="LoopControlPanel" testclass="LoopController">
+          <intProp name="LoopController.loops">-1</intProp>
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+        <ModuleController guiclass="ModuleControllerGui" testclass="ModuleController" testname="Executar fluxo autenticado" enabled="true">
+          <collectionProp name="ModuleController.node_path">
+            <stringProp name="raiz">Test Plan</stringProp>
+            <stringProp name="plano">CodeTracker - Tres grupos pelo ALB</stringProp>
+            <stringProp name="fluxo">Fluxo compartilhado - API pelo ALB</stringProp>
+          </collectionProp>
+        </ModuleController>
+        <hashTree/>
+      </hashTree>
+      <TestFragmentController guiclass="TestFragmentControllerGui" testclass="TestFragmentController" testname="Fluxo compartilhado - API pelo ALB" enabled="true">
+        <stringProp name="TestPlan.comments">Mesmo fluxo nos tres grupos; cada thread mantem seu proprio cookie. Nao executa como grupo independente.</stringProp>
+      </TestFragmentController>
+      <hashTree>
+        <CookieManager guiclass="CookiePanel" testclass="CookieManager" testname="Sessao isolada por usuario virtual" enabled="true">
+          <collectionProp name="CookieManager.cookies"/>
+          <boolProp name="CookieManager.clearEachIteration">false</boolProp>
+          <boolProp name="CookieManager.controlledByThreadGroup">false</boolProp>
+        </CookieManager>
+        <hashTree/>
+        <UniformRandomTimer guiclass="UniformRandomTimerGui" testclass="UniformRandomTimer" testname="Pausa entre requisicoes" enabled="true">
+          <stringProp name="ConstantTimer.delay">${__P(pausa_ms,500)}</stringProp>
+          <stringProp name="RandomTimer.range">${__P(variacao_ms,500)}</stringProp>
+        </UniformRandomTimer>
+        <hashTree/>
+        <DurationAssertion guiclass="DurationAssertionGui" testclass="DurationAssertion" testname="Limite por requisicao, nao percentil" enabled="true">
+          <stringProp name="DurationAssertion.duration">${__P(limite_resposta_ms,5000)}</stringProp>
+        </DurationAssertion>
+        <hashTree/>
+        <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="Validar status e contrato JSON" enabled="true">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="script">
+def nome = prev.getSampleLabel().split(&apos; :: &apos;, 2).last()
+if (!(nome in ['Login', 'Login - Perfil'])) return
+def codigo = prev.getResponseCode()
+if (codigo != '200') {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&quot;HTTP ${codigo} inesperado em ${nome}.&quot;)
+    if (codigo in [&apos;401&apos;, &apos;403&apos;, &apos;429&apos;]) {
+        log.error(&apos;Autenticacao/bloqueio na API; teste interrompido. Verifique cookies, JWT compartilhado e permissoes.&apos;)
+        prev.setStopTest(true)
+    }
+    return
+}
+if (codigo == &apos;204&apos;) return
+def corpo
+try {
+    corpo = new groovy.json.JsonSlurper().parseText(prev.getResponseDataAsString())
+} catch (IllegalArgumentException | groovy.json.JsonException ex) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&apos;HTTP 200 sem JSON valido; verifique /api e a imagem implantada.&apos;)
+    return
+}
+boolean valido = false
+switch (nome) {
+    case &apos;Login&apos;:
+        valido = corpo instanceof Map &amp;&amp; corpo.userId instanceof Number &amp;&amp; corpo.email == vars.get(&apos;email&apos;)
+        break
+    case 'Login - Perfil':
+        valido = corpo instanceof Map &amp;&amp; corpo.id?.toString() == vars.get('usuario_id') &amp;&amp; corpo.email == vars.get('email')
+        break
+}
+if (!valido) {
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(&quot;Contrato JSON inesperado em ${nome}; confira a tag Docker implantada.&quot;)
+    if (nome == &apos;Login&apos;) prev.setStopTest(true)
+}
+</stringProp>
+          <stringProp name="parameters"></stringProp>
+          <stringProp name="filename"></stringProp>
+        </JSR223Assertion>
+        <hashTree/>
+        <IfController guiclass="IfControllerPanel" testclass="IfController" testname="Login inicial ou renovacao JWT" enabled="true">
+          <stringProp name="IfController.condition">${__groovy(!vars.get(&apos;renovar_em&apos;) || System.currentTimeMillis() &gt;= vars.get(&apos;renovar_em&apos;).toLong())}</stringProp>
+          <boolProp name="IfController.evaluateAll">false</boolProp>
+          <boolProp name="IfController.useExpression">true</boolProp>
+        </IfController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${__threadGroupName} :: Login" enabled="true">
+            <stringProp name="HTTPSampler.path">/api/usuarios/login</stringProp>
+            <stringProp name="HTTPSampler.method">POST</stringProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+            <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+            <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+              <collectionProp name="Arguments.arguments">
+                <elementProp name="" elementType="HTTPArgument">
+                  <boolProp name="HTTPArgument.always_encode">false</boolProp>
+                  <stringProp name="Argument.value">${login_json}</stringProp>
+                  <stringProp name="Argument.metadata">=</stringProp>
+                </elementProp>
+              </collectionProp>
+            </elementProp>
+          </HTTPSamplerProxy>
+          <hashTree>
+            <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager" testname="Enviar JSON no login" enabled="true">
+              <collectionProp name="HeaderManager.headers">
+                <elementProp name="" elementType="Header">
+                  <stringProp name="Header.name">Content-Type</stringProp>
+                  <stringProp name="Header.value">application/json</stringProp>
+                </elementProp>
+              </collectionProp>
+            </HeaderManager>
+            <hashTree/>
+            <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="Preparar credenciais sem senha no JMX" enabled="true">
+              <stringProp name="scriptLanguage">groovy</stringProp>
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="script">
+vars.put(&apos;login_json&apos;, groovy.json.JsonOutput.toJson([
+    email: vars.get(&apos;email&apos;), senha: System.getenv(&apos;JMETER_PASSWORD&apos;)
+]))
+</stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="filename"></stringProp>
+            </JSR223PreProcessor>
+            <hashTree/>
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="Exigir cookie JWT utilizavel; parar em falha de login" enabled="true">
+              <stringProp name="scriptLanguage">groovy</stringProp>
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="script">
+vars.remove(&apos;login_json&apos;)
+def falhar = { String mensagem -&gt;
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(mensagem)
+    prev.setStopTest(true)
+    log.error(mensagem)
+}
+if (prev.getResponseCode() != &apos;200&apos;) {
+    falhar(&apos;Login recusado; confira credenciais e bloqueio antes de repetir o teste.&apos;)
+    return
+}
+def cookie = (prev.getResponseHeaders() =~ /(?im)^Set-Cookie:\s*authToken=([^;\s]+)([^\r\n]*)/)
+if (!cookie.find()) {
+    falhar(&apos;Login sem cookie authToken; confira a versao implantada.&apos;)
+    return
+}
+if (vars.get(&apos;protocolo&apos;) == &apos;http&apos; &amp;&amp; cookie.group(2) ==~ /(?i).*;\s*Secure(?:;.*)?/) {
+    falhar(&apos;Cookie Secure em HTTP. Configure HTTPS; nao desative validacao de cookies no JMeter.&apos;)
+    return
+}
+try {
+    def partes = cookie.group(1).split(/\./)
+    if (partes.length != 3) throw new IllegalArgumentException(&apos;Formato JWT invalido.&apos;)
+    def payload = new String(java.util.Base64.getUrlDecoder().decode(partes[1]), java.nio.charset.StandardCharsets.UTF_8)
+    def claims = new groovy.json.JsonSlurper().parseText(payload)
+    if (!(claims instanceof Map) || !(claims.exp instanceof Number)) throw new IllegalArgumentException(&apos;JWT sem exp.&apos;)
+    long renovar = claims.exp.longValue() * 1000L - 30000L
+    if (renovar &lt;= System.currentTimeMillis()) throw new IllegalArgumentException(&apos;JWT expirado ou muito curto.&apos;)
+    vars.put(&apos;renovar_em&apos;, renovar.toString())
+    def sessao = new groovy.json.JsonSlurper().parseText(prev.getResponseDataAsString())
+    if (!(sessao instanceof Map) || !(sessao.userId instanceof Number)) throw new IllegalArgumentException('Login sem userId.')
+    vars.put('usuario_id', sessao.userId.toString())
+    vars.put('abrir_dashboard', 'true')
+} catch (IllegalArgumentException | groovy.json.JsonException ex) {
+    falhar(&apos;JWT sem expiracao utilizavel; teste interrompido.&apos;)
+}
+</stringProp>
+              <stringProp name="parameters"></stringProp>
+              <stringProp name="filename"></stringProp>
+            </JSR223Assertion>
+            <hashTree/>
+          </hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${__threadGroupName} :: Login - Perfil" enabled="true">
+            <stringProp name="HTTPSampler.path">/api/usuarios/${usuario_id}</stringProp>
+            <stringProp name="HTTPSampler.method">GET</stringProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+          </HTTPSamplerProxy>
+          <hashTree/>
+        </hashTree>
+        <JSR223Sampler guiclass="TestBeanGUI" testclass="JSR223Sampler" testname="Preparar proxima navegacao (nao contabilizada)">
+          <stringProp name="scriptLanguage">groovy</stringProp>
+          <stringProp name="cacheKey">true</stringProp>
+          <stringProp name="script"><![CDATA[
+// A fila e privada da thread; dependencias so entram apos respostas validas.
+def fila = new java.util.ArrayDeque()
+int ciclo = (vars.get('ciclo_navegacao') ?: '0').toInteger()
+boolean mesmo = props.getProperty('navegacao', 'diferentes') == 'mesmo'
+def telas = ['dashboard', 'pecas', 'periodos', 'pedidos']
+def tela = mesmo ? props.getProperty('tela', 'pecas') : telas[(ctx.getThreadNum() + ciclo) % telas.size()]
+vars.put('ciclo_navegacao', (ciclo + 1).toString())
+vars.put('indice_conteudo', mesmo ? '0' : (ctx.getThreadNum() + ciclo).intdiv(telas.size()).toString())
+def adicionar = { nome, caminho, contrato, acao ->
+    fila.add([nome: nome, caminho: caminho, contrato: contrato, acao: acao])
+}
+if (vars.get('abrir_dashboard') == 'true' || tela == 'dashboard') {
+    adicionar('Dashboard - Ultimo periodo', '/api/periodos/ultimo', 'id', 'dashboard')
+    adicionar('Dashboard - Dados mensais', '/api/movimentacoes/dados-mensais?ano=' + java.time.Year.now().value, 'mensal', '')
+    vars.remove('abrir_dashboard')
+}
+switch (tela) {
+    case 'pecas':
+        adicionar('Pecas - Catalogo', '/api/itens?page=0&size=1000', 'catalogo', 'pecas')
+        break
+    case 'periodos':
+        adicionar('Periodos - Lista', '/api/periodos', 'listaIds', 'periodos')
+        break
+    case 'pedidos':
+        adicionar('Pedidos - Ultimo periodo', '/api/periodos/ultimo', 'id', 'pedidos')
+        break
+}
+vars.putObject('fila_navegacao', fila)
+SampleResult.setIgnore()
+]]></stringProp>
+        </JSR223Sampler>
+        <hashTree/>
+        <WhileController guiclass="WhileControllerGui" testclass="WhileController" testname="Executar chamadas da tela e dos detalhes">
+          <stringProp name="WhileController.condition">${__groovy(!vars.getObject('fila_navegacao').isEmpty())}</stringProp>
+        </WhileController>
+        <hashTree>
+          <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy" testname="${__threadGroupName} :: ${passo_nome}">
+            <stringProp name="HTTPSampler.path">${passo_caminho}</stringProp>
+            <stringProp name="HTTPSampler.method">GET</stringProp>
+            <boolProp name="HTTPSampler.use_keepalive">true</boolProp>
+            <boolProp name="HTTPSampler.follow_redirects">false</boolProp>
+            <boolProp name="HTTPSampler.auto_redirects">false</boolProp>
+          </HTTPSamplerProxy>
+          <hashTree>
+            <JSR223PreProcessor guiclass="TestBeanGUI" testclass="JSR223PreProcessor" testname="Selecionar chamada da tela">
+              <stringProp name="scriptLanguage">groovy</stringProp>
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="script"><![CDATA[
+def passo = vars.getObject('fila_navegacao').removeFirst()
+vars.putObject('passo_atual', passo)
+vars.put('passo_nome', passo.nome)
+vars.put('passo_caminho', passo.caminho)
+sampler.setName(ctx.getThreadGroup().getName() + ' :: ' + passo.nome)
+]]></stringProp>
+            </JSR223PreProcessor>
+            <hashTree/>
+            <JSR223Assertion guiclass="TestBeanGUI" testclass="JSR223Assertion" testname="Validar conteudo e correlacionar navegacao">
+              <stringProp name="scriptLanguage">groovy</stringProp>
+              <stringProp name="cacheKey">true</stringProp>
+              <stringProp name="script"><![CDATA[
+def passo = vars.getObject('passo_atual')
+def fila = vars.getObject('fila_navegacao')
+def falhar = { mensagem ->
+    AssertionResult.setFailure(true)
+    AssertionResult.setFailureMessage(mensagem)
+}
+def codigo = prev.getResponseCode()
+if (codigo == '204' && passo.nome == 'Peca - Similares') return
+if (codigo == '204' && passo.contrato == 'catalogo') {
+    log.warn('Catalogo vazio; nenhum detalhe de peca sera exercitado nesta navegacao.')
+    return
+}
+if (codigo != '200') {
+    falhar("HTTP ${codigo} em ${passo.nome}; rota usada pela tela: ${passo.caminho}.")
+    if (codigo in ['401', '403', '429']) {
+        log.error('Autenticacao/bloqueio na navegacao; teste interrompido.')
+        prev.setStopTest(true)
+    }
+    return
+}
+def corpo
+try {
+    corpo = new groovy.json.JsonSlurper().parseText(prev.getResponseDataAsString())
+} catch (IllegalArgumentException | groovy.json.JsonException ex) {
+    falhar("JSON invalido em ${passo.nome}.")
+    return
+}
+def listaIds = { lista -> lista instanceof List && lista.every { it instanceof Map && it.id instanceof Number } }
+def itens = passo.contrato == 'catalogo' && corpo instanceof Map ? corpo.content : corpo
+boolean valido = false
+switch (passo.contrato) {
+    case 'catalogo': valido = listaIds(itens); break
+    case 'listaIds': valido = listaIds(corpo); break
+    case 'lista': valido = corpo instanceof List && corpo.every { it instanceof Map }; break
+    case 'id': valido = corpo instanceof Map && corpo.id instanceof Number &&
+        (passo.id == null || corpo.id.toString() == passo.id.toString()); break
+    case 'cotacoes': valido = corpo instanceof Map && corpo.porcentagemViraramPedidos instanceof Number; break
+    case 'mensal': valido = corpo instanceof List && corpo.every {
+        it instanceof Map && it.mes instanceof Number && it.totalCompras instanceof Number &&
+        it.totalVendas instanceof Number && it.lucro instanceof Number
+    }; break
+    case 'precos': valido = corpo instanceof Map && corpo.containsKey('precoMedioCompra') &&
+        corpo.containsKey('precoMedioVenda'); break
+}
+if (!valido) {
+    falhar("Contrato JSON inesperado em ${passo.nome}; esperado ${passo.contrato}. Confira frontend e imagem implantada.")
+    return
+}
+def adicionar = { nome, caminho, contrato, acao = '', id = null ->
+    fila.add([nome: nome, caminho: caminho, contrato: contrato, acao: acao, id: id])
+}
+def escolher = { lista ->
+    lista.isEmpty() ? null : lista[vars.get('indice_conteudo').toInteger() % lista.size()]
+}
+switch (passo.acao) {
+    case 'dashboard':
+        adicionar('Dashboard - Status cotacoes', "/api/movimentacoes/${corpo.id}/status-cotacoes", 'cotacoes')
+        break
+    case 'pecas':
+        if (itens.isEmpty()) {
+            log.warn('Catalogo vazio; nenhum detalhe de peca sera exercitado nesta navegacao.')
+            break
+        }
+        itens.each { item ->
+            adicionar('Pecas - Quantidade por item', "/api/itensNaMovimentacao/item/${item.id}", 'lista')
+        }
+        def id = escolher(itens).id
+        adicionar('Peca - Detalhe', "/api/itens/${id}", 'id', '', id)
+        adicionar('Peca - Historico', "/api/itensNaMovimentacao/item/${id}", 'lista')
+        adicionar('Peca - Precos medios', "/api/itens/${id}/precos-medios", 'precos')
+        adicionar('Peca - Similares', "/api/itens/${id}/similares", 'listaIds')
+        adicionar('Peca - Fornecedores estatisticas', "/api/movimentacoes/${id}/fornecedores-estatisticas", 'lista')
+        break
+    case 'periodos':
+        def periodo = escolher(corpo)
+        if (periodo == null) {
+            log.warn('Lista de periodos vazia; detalhe nao sera exercitado.')
+            break
+        }
+        adicionar('Periodo - Recarregar lista no detalhe', '/api/periodos', 'listaIds')
+        adicionar('Periodo - Itens', "/api/itensNaMovimentacao/item/periodo/${periodo.id}", 'lista')
+        break
+    case 'pedidos':
+        adicionar('Pedidos - Lista periodo atual', "/api/movimentacoes/periodo/${corpo.id}", 'listaIds', 'listaPedidos')
+        // A tela possui filtros por tipo; consulte-os mesmo se a lista inicial divergir do contrato.
+        def tipos = ['ENTRADA', 'SAIDA', 'COTACAO']
+        def tipo = tipos[vars.get('indice_conteudo').toInteger() % tipos.size()]
+        adicionar('Pedidos - Filtro tipo', "/api/movimentacoes/buscar?tipo=${tipo}", 'listaIds', 'detalharPedido')
+        break
+    case 'listaPedidos':
+        // O detalhe sera aberto a partir da lista filtrada, evitando duplicar a mesma acao.
+        break
+    case 'detalharPedido':
+        def pedido = escolher(corpo)
+        if (pedido == null) {
+            log.warn('Filtro de pedidos vazio; detalhe nao sera exercitado.')
+            break
+        }
+        adicionar('Pedido - Detalhe', "/api/movimentacoes/${pedido.id}", 'id', 'relacionarPedido', pedido.id)
+        adicionar('Pedido - Itens', "/api/itensNaMovimentacao/movimentacao/${pedido.id}", 'lista')
+        break
+    case 'relacionarPedido':
+        def tipo = corpo.tipo?.nome?.toUpperCase()
+        def status = corpo.status?.nome?.toUpperCase()
+        if (tipo?.contains('SAIDA') && corpo.movimentacaoOriginalId instanceof Number) {
+            adicionar('Pedido - Cotacao origem', "/api/movimentacoes/${corpo.movimentacaoOriginalId}", 'id', 'itensRelacionados', corpo.movimentacaoOriginalId)
+        } else if (tipo?.contains('COTA') && status?.contains('CONCLU')) {
+            adicionar('Pedido - Buscar saida associada', '/api/movimentacoes/tipo/SAIDA', 'listaIds', 'saidaAssociada', corpo.id)
+        }
+        break
+    case 'itensRelacionados':
+        adicionar('Pedido - Itens relacionados', "/api/itensNaMovimentacao/movimentacao/${corpo.id}", 'lista')
+        break
+    case 'saidaAssociada':
+        def saida = corpo.find { it.movimentacaoOriginalId?.toString() == passo.id.toString() }
+        if (saida != null) adicionar('Pedido - Itens relacionados', "/api/itensNaMovimentacao/movimentacao/${saida.id}", 'lista')
+        break
+}
+]]></stringProp>
+            </JSR223Assertion>
+            <hashTree/>
+          </hashTree>
+        </hashTree>
+      </hashTree>
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>

@@ -5,6 +5,56 @@ Description: >-
   bastion SSH, um manager Docker Swarm, MySQL com recuperacao automatica
   entre AZs e um broker RabbitMQ em cada worker backend.
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: '1. Ambiente e acesso'
+        Parameters:
+          - EnvironmentName
+          - KeyName
+          - InstanceProfileName
+      - Label:
+          default: '2. Capacidade das instancias e sistema operacional'
+        Parameters:
+          - InstanceType
+          - BackendInstanceType
+          - FrontendInstanceType
+          - DatabaseInstanceType
+          - UbuntuAmiId
+      - Label:
+          default: '3. Imagens da aplicacao'
+        Parameters:
+          - DockerHubNamespace
+          - ApplicationImageTag
+      - Label:
+          default: '4. Banco de dados MySQL'
+        Parameters:
+          - DatabaseName
+          - DatabaseUser
+          - DatabasePassword
+      - Label:
+          default: '5. Autenticacao da aplicacao'
+        Parameters:
+          - AdminPassword
+          - JwtSecret
+      - Label:
+          default: '6. Mensageria RabbitMQ'
+        Parameters:
+          - RabbitMqUser
+          - RabbitMqPassword
+      - Label:
+          default: '7. E-mail e etiquetas'
+        Parameters:
+          - MailUsername
+          - MailPassword
+          - EtiquetaEmailDestinatario
+      - Label:
+          default: '8. Backup criptografado'
+        Parameters:
+          - EnableBackupArchive
+          - BackupCleanupRoleName
+
 Parameters:
   EnvironmentName:
     Type: String
@@ -56,6 +106,18 @@ Parameters:
     Default: LabInstanceProfile
     Description: Nome do IAM instance profile associado as instancias EC2.
     MinLength: 1
+
+  EnableBackupArchive:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Habilita arquivo GPG no S3 e cron adicional, sem alterar os timers de recuperacao.
+
+  BackupCleanupRoleName:
+    Type: String
+    Default: LabRole
+    AllowedPattern: '[a-zA-Z0-9+=,.@_/-]+'
+    Description: Role IAM existente com trust Lambda e permissao para esvaziar o bucket de backup na exclusao.
 
   UbuntuAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -123,6 +185,7 @@ Parameters:
 
   MailUsername:
     Type: String
+    Default: lamarautopecas@gmail.com
     Description: Conta SMTP usada pelo backend e pelas etiquetas para enviar e-mails.
     AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
@@ -136,6 +199,9 @@ Parameters:
     Type: String
     Description: E-mail que recebe as etiquetas geradas pelo consumer.
     AllowedPattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+
+Conditions:
+  BackupArchiveEnabled: !Equals [!Ref EnableBackupArchive, 'true']
 
 Mappings:
   Bootstrap:
@@ -255,11 +321,190 @@ Mappings:
           BOOTSTRAP_STAGE=configuration
         }
 
+        install_backup_archive() {
+          local enabled="$1" region="$2" stack="$3" bucket="$4" mode="$5"
+          [ "$enabled" = true ] || return 0
+          install_packages gnupg cron python3
+          BOOTSTRAP_STAGE=backup-archive-install
+          local installer
+          installer=$(mktemp /root/backup-installer.XXXXXXXX)
+          aws cloudformation describe-stack-resource \
+            --region "$region" --stack-name "$stack" \
+            --logical-resource-id BootstrapSignalHandle \
+            --query StackResourceDetail.Metadata --output text \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["BackupInstaller"], end="")' \
+            > "$installer"
+          bash "$installer" "$region" "$bucket" "$mode"
+          rm -- "$installer"
+          BOOTSTRAP_STAGE=configuration
+        }
+
         update_apt
 
 Resources:
-  BootstrapSignalHandle:
-    Type: AWS::CloudFormation::WaitConditionHandle
+  BackupGpgSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: BackupArchiveEnabled
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub '${EnvironmentName}: custodia GPG do backup. Excluida junto com a stack.'
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: passphrase
+        PasswordLength: 64
+        ExcludePunctuation: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backup-gpg'
+
+  BackupArchiveBucket:
+    Type: AWS::S3::Bucket
+    Condition: BackupArchiveEnabled
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backup-archive'
+
+  BackupArchiveBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: BackupArchiveEnabled
+    Properties:
+      Bucket: !Ref BackupArchiveBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt BackupArchiveBucket.Arn
+              - !Sub '${BackupArchiveBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  BackupCleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: BackupArchiveEnabled
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-backup-cleanup'
+      RetentionInDays: 7
+
+  BackupCleanupFunction:
+    Type: AWS::Lambda::Function
+    Condition: BackupArchiveEnabled
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${BackupCleanupRoleName}'
+      Timeout: 900
+      LoggingConfig:
+        LogGroup: !Ref BackupCleanupLogGroup
+      Code:
+        ZipFile: |
+          import logging
+
+          import boto3
+          import cfnresponse
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client("s3")
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def check_time(context):
+              if context.get_remaining_time_in_millis() < 30000:
+                  raise TimeoutError("Limpeza incompleta; tente excluir a stack novamente.")
+
+          def delete_objects(bucket, objects):
+              result = s3.delete_objects(
+                  Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
+              if result.get("Errors"):
+                  raise RuntimeError(f"Falha ao excluir objetos: {result['Errors']}")
+
+          def empty_bucket(bucket, context):
+              try:
+                  while True:
+                      check_time(context)
+                      result = s3.list_object_versions(Bucket=bucket, MaxKeys=1000)
+                      objects = [
+                          {"Key": item["Key"], "VersionId": item["VersionId"]}
+                          for item in result.get("Versions", []) + result.get("DeleteMarkers", [])
+                      ]
+                      if not objects:
+                          break
+                      delete_objects(bucket, objects)
+                  while True:
+                      check_time(context)
+                      result = s3.list_objects_v2(Bucket=bucket, MaxKeys=1000)
+                      objects = [{"Key": item["Key"]} for item in result.get("Contents", [])]
+                      if not objects:
+                          break
+                      delete_objects(bucket, objects)
+                  while True:
+                      check_time(context)
+                      uploads = s3.list_multipart_uploads(
+                          Bucket=bucket, MaxUploads=1000).get("Uploads", [])
+                      if not uploads:
+                          break
+                      for upload in uploads:
+                          check_time(context)
+                          s3.abort_multipart_upload(
+                              Bucket=bucket, Key=upload["Key"], UploadId=upload["UploadId"])
+              except ClientError as error:
+                  if error.response["Error"]["Code"] != "NoSuchBucket":
+                      raise
+                  logger.info("Bucket ja excluido: %s", bucket)
+
+          def lambda_handler(event, context):
+              physical_id = event.get("PhysicalResourceId", event["LogicalResourceId"])
+              try:
+                  if event["RequestType"] == "Delete":
+                      empty_bucket(event["ResourceProperties"]["Bucket"], context)
+                  elif event["RequestType"] == "Update":
+                      old_bucket = event["OldResourceProperties"]["Bucket"]
+                      if old_bucket != event["ResourceProperties"]["Bucket"]:
+                          empty_bucket(old_bucket, context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_id)
+              except Exception as error:
+                  logger.exception("Falha ao esvaziar bucket de backup")
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {}, physical_id, reason=str(error))
+
+  BackupArchiveCleanup:
+    Type: Custom::EmptyBackupBucket
+    Condition: BackupArchiveEnabled
+    DependsOn: BackupArchiveBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt BackupCleanupFunction.Arn
+      ServiceTimeout: 1000
+      Bucket: !Ref BackupArchiveBucket
 
   BootstrapWaitCondition:
     Type: AWS::CloudFormation::WaitCondition
@@ -699,10 +944,30 @@ Resources:
         - |
           #!/bin/bash
           BOOTSTRAP_RESOURCE=BastionInstance
+          # Ordena a exclusao: encerra os produtores antes de esvaziar o bucket.
+          # Backup cleanup: ${ArchiveCleanup}
           BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
           ${BootstrapScript}
 
+          if [ '${EnableBackupArchive}' = true ]; then
+            install_packages gnupg python3 ca-certificates curl unzip
+            install_aws_cli
+            BOOTSTRAP_STAGE=backup-gpg-provision
+            aws cloudformation describe-stack-resource \
+              --region '${AWS::Region}' --stack-name '${AWS::StackId}' \
+              --logical-resource-id BootstrapSignalHandle \
+              --query StackResourceDetail.Metadata --output text \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["BackupKeyGenerator"], end="")' \
+              > /usr/local/sbin/codetracker-backup-key
+            chmod 700 /usr/local/sbin/codetracker-backup-key
+            python3 /usr/local/sbin/codetracker-backup-key \
+              '${AWS::Region}' '${ArchiveBucket}' '${ArchiveSecret}'
+          fi
+
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+          ArchiveBucket: !If [BackupArchiveEnabled, !Ref BackupArchiveBucket, '']
+          ArchiveSecret: !If [BackupArchiveEnabled, !Ref BackupGpgSecret, '']
+          ArchiveCleanup: !If [BackupArchiveEnabled, !Ref BackupArchiveCleanup, 'disabled']
 
   BastionEip:
     Type: AWS::EC2::EIP
@@ -714,8 +979,535 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-ip-elastico-bastion'
 
+  BootstrapSignalHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      BackupKeyGenerator: |
+        import json
+        import os
+        from pathlib import Path
+        import re
+        import subprocess
+        import sys
+        import tempfile
+
+        def run(args, *, data=None):
+            result = subprocess.run(
+                args, input=data, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=600,
+            )
+            if result.returncode:
+                # Nao inclua respostas/argumentos com material privado na excecao.
+                raise RuntimeError(f"Falha em {args[0]} ({result.returncode}); confira IAM e conectividade.")
+            return result.stdout
+
+        def fingerprint(public_path):
+            listing = run([
+                "gpg", "--batch", "--with-colons", "--import-options", "show-only",
+                "--import", str(public_path),
+            ])
+            values = []
+            primary = False
+            for line in listing.splitlines():
+                fields = line.split(":")
+                if fields[0] == "pub":
+                    primary = True
+                elif fields[0] == "fpr" and primary:
+                    values.append(fields[9].upper())
+                    primary = False
+            if len(values) != 1 or not re.fullmatch(r"[A-F0-9]{40}", values[0]):
+                raise ValueError("Chave publica sem fingerprint primario RSA unico.")
+            return values[0]
+
+        def provision(region, bucket, secret_id):
+            os.umask(0o077)
+            aws = ["aws", "--region", region]
+            response = json.loads(run(aws + [
+                "secretsmanager", "get-secret-value", "--secret-id", secret_id,
+            ]))
+            secret = json.loads(response["SecretString"])
+            if not isinstance(secret.get("passphrase"), str) or not secret["passphrase"]:
+                raise ValueError("Segredo sem senha valida; geracao bloqueada.")
+            # /dev/shm e tmpfs: material privado transitorio nao vai para o disco raiz.
+            with tempfile.TemporaryDirectory(prefix="backup-gpg-", dir="/dev/shm") as directory:
+                root = Path(directory)
+                home = root / "gnupg"
+                home.mkdir(mode=0o700)
+                previous = os.environ.get("GNUPGHOME")
+                os.environ["GNUPGHOME"] = str(home)
+                try:
+                    public = root / "public.asc"
+                    if set(secret) == {"passphrase"}:
+                        run([
+                            "gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase-fd", "0",
+                            "--quick-generate-key", "CodeTracker backup", "rsa4096", "cert", "0",
+                        ], data=secret["passphrase"] + "\n")
+                        public.write_text(run(["gpg", "--armor", "--export"]), encoding="utf-8")
+                        fpr = fingerprint(public)
+                        run([
+                            "gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase-fd", "0",
+                            "--quick-add-key", fpr, "rsa4096", "encr", "0",
+                        ], data=secret["passphrase"] + "\n")
+                        secret.update({
+                            "fingerprint": fpr,
+                            "public_key": run(["gpg", "--armor", "--export", fpr]),
+                            "private_key": run([
+                                "gpg", "--batch", "--pinentry-mode", "loopback", "--passphrase-fd", "0",
+                                "--armor", "--export-secret-keys", fpr,
+                            ], data=secret["passphrase"] + "\n"),
+                        })
+                        if "BEGIN PGP PRIVATE KEY BLOCK" not in secret["private_key"]:
+                            raise ValueError("Exportacao privada vazia; publicacao bloqueada.")
+                        payload = root / "secret.json"
+                        payload.write_text(json.dumps(secret), encoding="utf-8")
+                        run(aws + [
+                            "secretsmanager", "put-secret-value", "--secret-id", secret_id,
+                            "--secret-string", "file://" + str(payload),
+                        ])
+                    required = {"passphrase", "fingerprint", "public_key", "private_key"}
+                    if not required.issubset(secret) or not all(isinstance(secret[k], str) and secret[k] for k in required):
+                        raise ValueError("Segredo GPG incompleto; nao sera substituido por outra chave.")
+                    if "BEGIN PGP PRIVATE KEY BLOCK" not in secret["private_key"]:
+                        raise ValueError("Custodia privada invalida; publicacao bloqueada.")
+                    public.write_text(secret["public_key"], encoding="utf-8")
+                    if "PRIVATE KEY" in secret["public_key"] or fingerprint(public) != secret["fingerprint"]:
+                        raise ValueError("Chave publica inconsistente com a custodia.")
+                    fpr_path = root / "fingerprint.txt"
+                    fpr_path.write_text(secret["fingerprint"] + "\n", encoding="ascii")
+                    # Custodia gravada antes de tornar a chave disponivel aos backups.
+                    run(aws + ["s3", "cp", str(public), f"s3://{bucket}/keys/grupo7-publica.asc", "--only-show-errors"])
+                    run(aws + ["s3", "cp", str(fpr_path), f"s3://{bucket}/keys/fingerprint.txt", "--only-show-errors"])
+                finally:
+                    try:
+                        run(["gpgconf", "--homedir", str(home), "--kill", "gpg-agent"])
+                    finally:
+                        if previous is None:
+                            os.environ.pop("GNUPGHOME", None)
+                        else:
+                            os.environ["GNUPGHOME"] = previous
+            print("Chave GPG provisionada; custodia no Secrets Manager, publica no S3.")
+
+        if __name__ == "__main__":
+            provision(*sys.argv[1:])
+
+      BackupInstaller: |
+        #!/bin/bash
+        set -Eeuo pipefail
+        umask 077
+        region=$1 bucket=$2 mode=$3
+        case "$mode" in app|banco) ;; *) echo "Modo invalido" >&2; exit 1 ;; esac
+        install -d -m 700 /etc/codetracker-backup /bckp/app /bckp/db /bckp/logs
+        export GNUPGHOME=/etc/codetracker-backup/gnupg
+        install -d -m 700 "$GNUPGHOME"
+        key=$(mktemp /etc/codetracker-backup/public.XXXXXXXX)
+        fpr_file=$(mktemp /etc/codetracker-backup/fingerprint.XXXXXXXX)
+        trap 'rm -f -- "$key" "$fpr_file"' EXIT
+        ready=false
+        # A publicacao so ocorre depois da custodia privada ser persistida.
+        for attempt in $(seq 1 120); do
+          if aws s3 cp "s3://$bucket/keys/fingerprint.txt" "$fpr_file" \
+            --region "$region" --only-show-errors; then
+            ready=true
+            break
+          fi
+          echo "Aguardando chave publica do bastion (tentativa $attempt/120)." >&2
+          sleep 10
+        done
+        [ "$ready" = true ] || { echo "ERRO: chave publica indisponivel apos 20 minutos." >&2; exit 1; }
+        fingerprint=$(cat "$fpr_file")
+        [[ "$fingerprint" =~ ^[A-F0-9]{40}$ ]] || { echo "Fingerprint invalido" >&2; exit 1; }
+        aws s3 cp "s3://$bucket/keys/grupo7-publica.asc" "$key" --region "$region" --only-show-errors
+        # Nao importe material privado nem chaves adicionais ao chaveiro de producao.
+        packets=$(gpg --batch --list-packets "$key")
+        if grep -q ':secret' <<< "$packets"; then
+          echo "ERRO: o objeto fornecido contem chave privada." >&2
+          exit 1
+        fi
+        actual=$(gpg --batch --with-colons --import-options show-only --import "$key" \
+          | awk -F: '$1=="pub" { primary=1; next } $1=="fpr" && primary { print toupper($10); primary=0 }')
+        if [ "$actual" != "${fingerprint^^}" ]; then
+          echo "ERRO: fingerprint diferente ou varias chaves primarias no objeto." >&2
+          exit 1
+        fi
+        gpg --batch --import "$key"
+        printf 'REGION=%q\nBUCKET=%q\nFPR=%q\nMODE=%q\n' \
+          "$region" "$bucket" "${fingerprint^^}" "$mode" > /etc/codetracker-backup/archive.conf
+
+        cat > /usr/local/sbin/codetracker-backup-archive <<'ARCHIVE'
+        #!/bin/bash
+        set -Eeuo pipefail
+        umask 077
+        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        export LC_ALL=C
+        export GNUPGHOME=/etc/codetracker-backup/gnupg
+        source /etc/codetracker-backup/archive.conf
+        exec 9>/run/lock/codetracker-backup-archive.lock
+        flock -n 9 || { echo "ERRO: outro arquivo de backup em execucao." >&2; exit 1; }
+        host=$(hostname -s)
+        id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        log="/bckp/logs/archive-$id.log"
+        exec >> "$log" 2>&1
+        work=
+        finish() {
+          local status=$?
+          trap - EXIT
+          if [ -n "$work" ]; then
+            if ! rm -f -- "$work/lamar.sql" "$work/app.tar.gz" "$work/mysql-version.txt" \
+              "$work/snapshot.txt" "$work/conteudo.sha256" "$work/backup.tar.gz" \
+              "$work/recebido.gpg" "$work/recebido.sha256"; then status=1; fi
+            if ! rmdir -- "$work"; then status=1; fi
+          fi
+          printf 'FIM=%s STATUS_EXECUCAO=%s\n' "$(date -u +%FT%TZ)" "$status"
+          if ! aws s3 cp "$log" "s3://$BUCKET/logs/$host/$MODE/$id.log" \
+            --region "$REGION" --only-show-errors; then
+            echo "ERRO: log nao enviado ao S3; preservado em $log." >&2
+            logger -p user.err -t codetracker-backup "Falha enviando log $log ao S3"
+            status=1
+          fi
+          if [ "$status" -ne 0 ]; then
+            logger -p user.err -t codetracker-backup "Backup falhou: $log"
+          fi
+          exit "$status"
+        }
+        trap finish EXIT
+        trap 'echo "ERRO: linha $LINENO" >&2' ERR
+        trap 'exit 143' TERM
+        trap 'exit 130' INT
+        printf 'INICIO=%s HOST=%s TIPO=%s\n' "$(date -u +%FT%TZ)" "$host" "$MODE"
+        if [ "$MODE" = banco ]; then
+          # A restauracao periodica desabilita read_only temporariamente na AZ1.
+          if [ -f /etc/codetracker/recovery.json ] && \
+             [ ! -f /var/lib/mysql/.codetracker-recovery/promoted ]; then
+            echo "IGNORADO: standby ainda nao promovido."
+            exit 0
+          fi
+          active=$(mysql --protocol=socket -u root -Nse \
+            'SELECT @@global.read_only = 0 AND @@global.super_read_only = 0')
+          if [ "$active" != 1 ]; then
+            echo "IGNORADO: banco somente leitura; arquivamento pertence ao banco ativo."
+            exit 0
+          fi
+          engines=$(mysql --protocol=socket -u root -Nse \
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='lamar' AND table_type='BASE TABLE' AND engine <> 'InnoDB'")
+          [ "$engines" = 0 ] || { echo "ERRO: tabela nao InnoDB." >&2; exit 1; }
+          base=/bckp/db
+        else
+          base=/bckp/app
+        fi
+        work=$(mktemp -d "$base/.work-$id.XXXXXXXX")
+        date -u +%FT%TZ > "$work/snapshot.txt"
+        if [ "$MODE" = banco ]; then
+          mysql --protocol=socket -u root -Nse 'SELECT @@version' > "$work/mysql-version.txt"
+          mysqldump --protocol=socket -u root --single-transaction --quick \
+            --routines --events --triggers --hex-blob --no-tablespaces \
+            --set-gtid-purged=OFF --databases lamar > "$work/lamar.sql"
+          test -s "$work/lamar.sql"
+          # Bloqueia publicacao se o papel do servidor mudou durante o dump.
+          active=$(mysql --protocol=socket -u root -Nse \
+            'SELECT @@global.read_only = 0 AND @@global.super_read_only = 0')
+          [ "$active" = 1 ] || { echo "ERRO: banco deixou de ser ativo." >&2; exit 1; }
+          files=(lamar.sql mysql-version.txt snapshot.txt)
+        else
+          tar -C / -czf "$work/app.tar.gz" opt/codetracker
+          files=(app.tar.gz snapshot.txt)
+        fi
+        (
+          cd "$work"
+          sha256sum "${files[@]}" > conteudo.sha256
+          tar -czf backup.tar.gz "${files[@]}" conteudo.sha256
+        )
+        destination="$base/$id"
+        mkdir -m 700 "$destination"
+        (
+          cd "$work"
+          sha256sum backup.tar.gz > "$destination/original.sha256"
+        )
+        gpg --batch --trust-model always --recipient "$FPR" \
+          --output "$destination/backup.tar.gz.gpg" --encrypt "$work/backup.tar.gz"
+        (
+          cd "$destination"
+          sha256sum backup.tar.gz.gpg original.sha256 > checksum.sha256
+          cat checksum.sha256
+          sha256sum --check checksum.sha256
+        )
+        remote="s3://$BUCKET/backups/$host/$MODE/$id"
+        for file in backup.tar.gz.gpg original.sha256 checksum.sha256; do
+          aws s3 cp "$destination/$file" "$remote/$file" --region "$REGION" --only-show-errors
+        done
+        echo "VALIDANDO_DOWNLOAD_S3=$remote"
+        aws s3 cp "$remote/backup.tar.gz.gpg" "$work/recebido.gpg" --region "$REGION" --only-show-errors
+        cmp "$destination/backup.tar.gz.gpg" "$work/recebido.gpg"
+        for file in original.sha256 checksum.sha256; do
+          aws s3 cp "$remote/$file" "$work/recebido.sha256" --region "$REGION" --only-show-errors
+          cmp "$destination/$file" "$work/recebido.sha256"
+        done
+        printf 'SNAPSHOT=%s\nTRANSFERENCIA_VALIDADA=%s\n' \
+          "$(cat "$work/snapshot.txt")" "$(date -u +%FT%TZ)" > "$destination/SUCESSO-S3.txt"
+        aws s3 cp "$destination/SUCESSO-S3.txt" "$remote/SUCESSO-S3.txt" \
+          --region "$REGION" --only-show-errors
+        install -m 600 "$work/snapshot.txt" /etc/codetracker-backup/ultimo-sucesso.txt
+        echo "BACKUP_S3_ENVIADO_E_VERIFICADO=$remote"
+        ARCHIVE
+        chmod 700 /usr/local/sbin/codetracker-backup-archive
+        cat > /etc/cron.d/codetracker-backup-archive <<'CRON'
+        SHELL=/bin/bash
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+        # Domingo e quarta as 02:00 no fuso do host (Ubuntu da stack: UTC).
+        0 2 * * 0,3 root /usr/bin/timeout --signal=TERM --kill-after=60s 3h /usr/local/sbin/codetracker-backup-archive
+        CRON
+        chmod 644 /etc/cron.d/codetracker-backup-archive
+        cat > /etc/logrotate.d/codetracker-backup-archive <<'ROTATE'
+        /bckp/logs/archive-*.log {
+            weekly
+            rotate 6
+            maxage 42
+            missingok
+            notifempty
+            compress
+            su root root
+        }
+        ROTATE
+        systemctl enable --now cron
+        # Primeira copia e prova de permissao S3 antes de sinalizar sucesso.
+        /usr/local/sbin/codetracker-backup-archive
+
   SwarmManagerInstance:
     Type: AWS::EC2::Instance
+    Metadata:
+      StackCompose: !Sub |
+        version: '3.8'
+        services:
+          backend:
+            image: ${DockerHubNamespace}/codetracker-backend:${ApplicationImageTag}
+            environment:
+              DB_HOST: '${DatabaseEndpointRecord}'
+              DB_NAME: '${DatabaseName}'
+              DB_USERNAME: '${DatabaseUser}'
+              SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
+              MAIL_USERNAME: '${MailUsername}'
+              SPRING_RABBITMQ_ADDRESSES: '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
+              SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
+              SPRING_DATASOURCE_HIKARI_CONNECTIONTIMEOUT: '10000'
+              SPRING_DATASOURCE_HIKARI_VALIDATIONTIMEOUT: '5000'
+              SPRING_DATASOURCE_HIKARI_MAXLIFETIME: '60000'
+              JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0 -Dsun.net.inetaddr.ttl=10'
+            secrets:
+              - source: database_password
+                target: DB_PASSWORD
+              - source: rabbitmq_password
+                target: spring.rabbitmq.password
+              - source: jwt_secret
+                target: JWT_SECRET
+              - source: mail_password
+                target: MAIL_PASSWORD
+            networks:
+              application:
+                aliases: [backend]
+            deploy:
+              replicas: 4
+              endpoint_mode: vip
+              placement:
+                constraints: [node.labels.tier == backend]
+                max_replicas_per_node: 2
+              resources:
+                limits:
+                  memory: 768M
+              restart_policy:
+                condition: any
+                delay: 10s
+          etiquetas:
+            image: ${DockerHubNamespace}/codetracker-etiquetas:${ApplicationImageTag}
+            environment:
+              BACKEND_API_BASE_URL: 'http://backend:8080'
+              DB_HOST: '${DatabaseEndpointRecord}'
+              DB_NAME: '${DatabaseName}'
+              DB_USERNAME: '${DatabaseUser}'
+              SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
+              SPRING_JPA_HIBERNATE_DDL_AUTO: 'update'
+              SPRING_RABBITMQ_ADDRESSES: '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
+              SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
+              MAIL_USERNAME: '${MailUsername}'
+              ETIQUETA_EMAIL_DESTINATARIO: '${EtiquetaEmailDestinatario}'
+              JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0'
+            secrets:
+              - source: database_password
+                target: DB_PASSWORD
+              - source: rabbitmq_password
+                target: spring.rabbitmq.password
+              - source: mail_password
+                target: MAIL_PASSWORD
+            networks:
+              application:
+                aliases: [etiquetas]
+            deploy:
+              replicas: 2
+              placement:
+                constraints: [node.labels.tier == backend]
+                max_replicas_per_node: 1
+              resources:
+                limits:
+                  memory: 512M
+              restart_policy:
+                condition: any
+                delay: 10s
+          frontend:
+            image: ${DockerHubNamespace}/codetracker-frontend:${ApplicationImageTag}
+            ports:
+              - target: 80
+                published: 80
+                protocol: tcp
+                mode: host
+            networks:
+              application:
+                aliases: [frontend]
+            deploy:
+              replicas: 2
+              placement:
+                constraints: [node.labels.tier == web]
+                max_replicas_per_node: 1
+              resources:
+                limits:
+                  memory: 128M
+              restart_policy:
+                condition: any
+                delay: 10s
+        networks:
+          application:
+            driver: overlay
+            attachable: true
+        secrets:
+          database_password:
+            external: true
+            name: codetracker-db-password
+          rabbitmq_password:
+            external: true
+            name: codetracker-rabbitmq-password
+          jwt_secret:
+            external: true
+            name: codetracker-jwt-secret
+          mail_password:
+            external: true
+            name: codetracker-mail-password
+      WorkerSetupScript: !Sub |
+        #!/bin/bash
+        set -euo pipefail
+
+        signal_manager_failure() {
+          local exit_status="$?"
+          trap - EXIT
+          if (( exit_status != 0 )); then
+            echo "Falha na configuracao ou validacao da aplicacao no Swarm." >&2
+            if ! aws cloudformation signal-resource \
+              --region '${AWS::Region}' \
+              --stack-name '${AWS::StackId}' \
+              --logical-resource-id SwarmManagerInstance \
+              --unique-id swarm-manager-az1 \
+              --status FAILURE; then
+              echo "Nao foi possivel sinalizar a falha do SwarmManagerInstance ao CloudFormation." >&2
+            fi
+          fi
+          exit "$exit_status"
+        }
+        trap signal_manager_failure EXIT
+
+        WORKERS_READY=false
+        for attempt in $(seq 1 60); do
+          ALL_WORKERS_READY=true
+
+          while read -r NODE_NAME TIER ZONE; do
+            [ -n "$NODE_NAME" ] || continue
+            NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}} {{.Status}}' | awk '$2 == "Ready" && !found { print $1; found = 1 }')
+
+            if [ -z "$NODE_ID" ]; then
+              ALL_WORKERS_READY=false
+              continue
+            fi
+
+            docker node update \
+              --label-add "tier=$TIER" \
+              --label-add "zone=$ZONE" \
+              "$NODE_ID"
+          done <<'NODES'
+        web-az1 web az1
+        web-az2 web az2
+        backend-az1 backend az1
+        backend-az2 backend az2
+        NODES
+
+          if [ "$ALL_WORKERS_READY" = true ]; then
+            WORKERS_READY=true
+            break
+          fi
+          sleep 10
+        done
+
+        if [ "$WORKERS_READY" != true ]; then
+          echo "Os workers previstos nao ficaram prontos no Swarm apos 10 minutos." >&2
+          docker node ls >&2
+          exit 1
+        fi
+
+        DATABASE_READY=false
+        for attempt in $(seq 1 90); do
+          DATABASE_STACK=$(aws ssm get-parameter \
+            --region '${AWS::Region}' \
+            --name '/${EnvironmentName}/database/ready' \
+            --query Parameter.Value --output text 2>/dev/null || true)
+          STANDBY_STACK=$(aws ssm get-parameter \
+            --region '${AWS::Region}' \
+            --name '/${EnvironmentName}/database/standby-ready' \
+            --query Parameter.Value --output text 2>/dev/null || true)
+          if [ "$DATABASE_STACK" = '${AWS::StackId}' ] && [ "$STANDBY_STACK" = '${AWS::StackId}' ]; then
+            DATABASE_READY=true
+            break
+          fi
+          sleep 10
+        done
+        if [ "$DATABASE_READY" != true ]; then
+          echo "A importacao do banco ou a primeira copia na AZ1 nao foi concluida." >&2
+          exit 1
+        fi
+
+        docker stack deploy --compose-file /opt/codetracker/stack.yml codetracker
+
+        for attempt in $(seq 1 90); do
+          READY_SERVICES=$(docker service ls --filter label=com.docker.stack.namespace=codetracker \
+            --format '{{.Name}} {{.Replicas}}' | awk '
+              $1 == "codetracker_backend" && $2 == "4/4" { ready++ }
+              $1 == "codetracker_frontend" && $2 == "2/2" { ready++ }
+              $1 == "codetracker_etiquetas" && $2 == "2/2" { ready++ }
+              END { print ready + 0 }
+            ')
+
+          if [ "$READY_SERVICES" = 3 ]; then
+            if curl --fail --silent --show-error --max-time 15 \
+              'http://${ApplicationLoadBalancer.DNSName}/' > /dev/null; then
+              BACKEND_STATUS=$(curl \
+                --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
+                'http://${ApplicationLoadBalancer.DNSName}/api/' || true)
+              ETIQUETAS_STATUS=$(curl \
+                --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
+                'http://${ApplicationLoadBalancer.DNSName}/etiquetas-api/' || true)
+
+              if [[ "$BACKEND_STATUS" =~ ^[234][0-9][0-9]$ ]] && \
+                 [[ "$ETIQUETAS_STATUS" =~ ^[234][0-9][0-9]$ ]]; then
+                aws cloudformation signal-resource \
+                  --region '${AWS::Region}' \
+                  --stack-name '${AWS::StackId}' \
+                  --logical-resource-id SwarmManagerInstance \
+                  --unique-id swarm-manager-az1 \
+                  --status SUCCESS
+                trap - EXIT
+                exit 0
+              fi
+            fi
+          fi
+
+          sleep 10
+        done
+
+        docker service ls
+        exit 1
     CreationPolicy:
       ResourceSignal:
         Count: 1
@@ -748,6 +1540,7 @@ Resources:
         - |
           #!/bin/bash
           BOOTSTRAP_RESOURCE=SwarmManagerInstance
+          # Backup cleanup: ${ArchiveCleanup}
           BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
           ${BootstrapScript}
 
@@ -815,244 +1608,22 @@ Resources:
             --overwrite
           mkdir -p /opt/codetracker
 
-          cat > /opt/codetracker/stack.yml <<'STACK'
-          version: '3.8'
-          services:
-            backend:
-              image: ${DockerHubNamespace}/codetracker-backend:${ApplicationImageTag}
-              environment:
-                DB_HOST: '${DatabaseEndpointRecord}'
-                DB_NAME: '${DatabaseName}'
-                DB_USERNAME: '${DatabaseUser}'
-                SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
-                MAIL_USERNAME: '${MailUsername}'
-                SPRING_RABBITMQ_ADDRESSES: '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
-                SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
-                SPRING_DATASOURCE_HIKARI_CONNECTIONTIMEOUT: '10000'
-                SPRING_DATASOURCE_HIKARI_VALIDATIONTIMEOUT: '5000'
-                SPRING_DATASOURCE_HIKARI_MAXLIFETIME: '60000'
-                JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0 -Dsun.net.inetaddr.ttl=10'
-              secrets:
-                - source: database_password
-                  target: DB_PASSWORD
-                - source: rabbitmq_password
-                  target: spring.rabbitmq.password
-                - source: jwt_secret
-                  target: JWT_SECRET
-                - source: mail_password
-                  target: MAIL_PASSWORD
-              networks:
-                application:
-                  aliases: [backend]
-              deploy:
-                replicas: 4
-                endpoint_mode: vip
-                placement:
-                  constraints: [node.labels.tier == backend]
-                  max_replicas_per_node: 2
-                resources:
-                  limits:
-                    memory: 768M
-                restart_policy:
-                  condition: any
-                  delay: 10s
-            etiquetas:
-              image: ${DockerHubNamespace}/codetracker-etiquetas:${ApplicationImageTag}
-              environment:
-                BACKEND_API_BASE_URL: 'http://backend:8080'
-                DB_HOST: '${DatabaseEndpointRecord}'
-                DB_NAME: '${DatabaseName}'
-                DB_USERNAME: '${DatabaseUser}'
-                SPRING_CONFIG_IMPORT: 'configtree:/run/secrets/'
-                SPRING_JPA_HIBERNATE_DDL_AUTO: 'update'
-                SPRING_RABBITMQ_ADDRESSES: '${BackendInstanceAz1.PrivateIp}:5672,${BackendInstanceAz2.PrivateIp}:5672'
-                SPRING_RABBITMQ_USERNAME: '${RabbitMqUser}'
-                MAIL_USERNAME: '${MailUsername}'
-                ETIQUETA_EMAIL_DESTINATARIO: '${EtiquetaEmailDestinatario}'
-                JAVA_TOOL_OPTIONS: '-XX:MaxRAMPercentage=65.0'
-              secrets:
-                - source: database_password
-                  target: DB_PASSWORD
-                - source: rabbitmq_password
-                  target: spring.rabbitmq.password
-                - source: mail_password
-                  target: MAIL_PASSWORD
-              networks:
-                application:
-                  aliases: [etiquetas]
-              deploy:
-                replicas: 2
-                placement:
-                  constraints: [node.labels.tier == backend]
-                  max_replicas_per_node: 1
-                resources:
-                  limits:
-                    memory: 512M
-                restart_policy:
-                  condition: any
-                  delay: 10s
-            frontend:
-              image: ${DockerHubNamespace}/codetracker-frontend:${ApplicationImageTag}
-              ports:
-                - target: 80
-                  published: 80
-                  protocol: tcp
-                  mode: host
-              networks:
-                application:
-                  aliases: [frontend]
-              deploy:
-                replicas: 2
-                placement:
-                  constraints: [node.labels.tier == web]
-                  max_replicas_per_node: 1
-                resources:
-                  limits:
-                    memory: 128M
-                restart_policy:
-                  condition: any
-                  delay: 10s
-          networks:
-            application:
-              driver: overlay
-              attachable: true
-          secrets:
-            database_password:
-              external: true
-              name: codetracker-db-password
-            rabbitmq_password:
-              external: true
-              name: codetracker-rabbitmq-password
-            jwt_secret:
-              external: true
-              name: codetracker-jwt-secret
-            mail_password:
-              external: true
-              name: codetracker-mail-password
-          STACK
+          BOOTSTRAP_STAGE=swarm-compose-download
+          aws cloudformation describe-stack-resource \
+            --region '${AWS::Region}' --stack-name '${AWS::StackId}' \
+            --logical-resource-id SwarmManagerInstance \
+            --query StackResourceDetail.Metadata --output text \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["StackCompose"], end="")' \
+            > /opt/codetracker/stack.yml
 
-          cat > /usr/local/sbin/label-swarm-workers <<'SCRIPT'
-          #!/bin/bash
-          set -euo pipefail
-
-          signal_manager_failure() {
-            local exit_status="$?"
-            trap - EXIT
-            if (( exit_status != 0 )); then
-              echo "Falha na configuracao ou validacao da aplicacao no Swarm." >&2
-              if ! aws cloudformation signal-resource \
-                --region '${AWS::Region}' \
-                --stack-name '${AWS::StackId}' \
-                --logical-resource-id SwarmManagerInstance \
-                --unique-id swarm-manager-az1 \
-                --status FAILURE; then
-                echo "Nao foi possivel sinalizar a falha do SwarmManagerInstance ao CloudFormation." >&2
-              fi
-            fi
-            exit "$exit_status"
-          }
-          trap signal_manager_failure EXIT
-
-          WORKERS_READY=false
-          for attempt in $(seq 1 60); do
-            ALL_WORKERS_READY=true
-
-            while read -r NODE_NAME TIER ZONE; do
-              [ -n "$NODE_NAME" ] || continue
-              NODE_ID=$(docker node ls --filter "name=$NODE_NAME" --format '{{.ID}} {{.Status}}' | awk '$2 == "Ready" && !found { print $1; found = 1 }')
-
-              if [ -z "$NODE_ID" ]; then
-                ALL_WORKERS_READY=false
-                continue
-              fi
-
-              docker node update \
-                --label-add "tier=$TIER" \
-                --label-add "zone=$ZONE" \
-                "$NODE_ID"
-            done <<'NODES'
-          web-az1 web az1
-          web-az2 web az2
-          backend-az1 backend az1
-          backend-az2 backend az2
-          NODES
-
-            if [ "$ALL_WORKERS_READY" = true ]; then
-              WORKERS_READY=true
-              break
-            fi
-            sleep 10
-          done
-
-          if [ "$WORKERS_READY" != true ]; then
-            echo "Os workers previstos nao ficaram prontos no Swarm apos 10 minutos." >&2
-            docker node ls >&2
-            exit 1
-          fi
-
-          DATABASE_READY=false
-          for attempt in $(seq 1 90); do
-            DATABASE_STACK=$(aws ssm get-parameter \
-              --region '${AWS::Region}' \
-              --name '/${EnvironmentName}/database/ready' \
-              --query Parameter.Value --output text 2>/dev/null || true)
-            STANDBY_STACK=$(aws ssm get-parameter \
-              --region '${AWS::Region}' \
-              --name '/${EnvironmentName}/database/standby-ready' \
-              --query Parameter.Value --output text 2>/dev/null || true)
-            if [ "$DATABASE_STACK" = '${AWS::StackId}' ] && [ "$STANDBY_STACK" = '${AWS::StackId}' ]; then
-              DATABASE_READY=true
-              break
-            fi
-            sleep 10
-          done
-          if [ "$DATABASE_READY" != true ]; then
-            echo "A importacao do banco ou a primeira copia na AZ1 nao foi concluida." >&2
-            exit 1
-          fi
-
-          docker stack deploy --compose-file /opt/codetracker/stack.yml codetracker
-
-          for attempt in $(seq 1 90); do
-            READY_SERVICES=$(docker service ls --filter label=com.docker.stack.namespace=codetracker \
-              --format '{{.Name}} {{.Replicas}}' | awk '
-                $1 == "codetracker_backend" && $2 == "4/4" { ready++ }
-                $1 == "codetracker_frontend" && $2 == "2/2" { ready++ }
-                $1 == "codetracker_etiquetas" && $2 == "2/2" { ready++ }
-                END { print ready + 0 }
-              ')
-
-            if [ "$READY_SERVICES" = 3 ]; then
-              if curl --fail --silent --show-error --max-time 15 \
-                'http://${ApplicationLoadBalancer.DNSName}/' > /dev/null; then
-                BACKEND_STATUS=$(curl \
-                  --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
-                  'http://${ApplicationLoadBalancer.DNSName}/api/' || true)
-                ETIQUETAS_STATUS=$(curl \
-                  --silent --show-error --max-time 15 --output /dev/null --write-out '%{http_code}' \
-                  'http://${ApplicationLoadBalancer.DNSName}/etiquetas-api/' || true)
-
-                if [[ "$BACKEND_STATUS" =~ ^[234][0-9][0-9]$ ]] && \
-                   [[ "$ETIQUETAS_STATUS" =~ ^[234][0-9][0-9]$ ]]; then
-                  aws cloudformation signal-resource \
-                    --region '${AWS::Region}' \
-                    --stack-name '${AWS::StackId}' \
-                    --logical-resource-id SwarmManagerInstance \
-                    --unique-id swarm-manager-az1 \
-                    --status SUCCESS
-                  trap - EXIT
-                  exit 0
-                fi
-              fi
-            fi
-
-            sleep 10
-          done
-
-          docker service ls
-          exit 1
-          SCRIPT
-
+          BOOTSTRAP_STAGE=swarm-worker-setup-download
+          aws cloudformation describe-stack-resource \
+            --region '${AWS::Region}' --stack-name '${AWS::StackId}' \
+            --logical-resource-id SwarmManagerInstance \
+            --query StackResourceDetail.Metadata --output text \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["WorkerSetupScript"], end="")' \
+            > /usr/local/sbin/label-swarm-workers
+          bash -n /usr/local/sbin/label-swarm-workers
           chmod 750 /usr/local/sbin/label-swarm-workers
 
           cat > /etc/systemd/system/label-swarm-workers.service <<'SERVICE'
@@ -1075,8 +1646,12 @@ Resources:
 
           systemctl daemon-reload
           systemctl enable label-swarm-workers.service
+          install_backup_archive '${EnableBackupArchive}' '${AWS::Region}' '${AWS::StackId}' \
+            '${ArchiveBucket}' app
           systemctl start --no-block label-swarm-workers.service
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+          ArchiveBucket: !If [BackupArchiveEnabled, !Ref BackupArchiveBucket, '']
+          ArchiveCleanup: !If [BackupArchiveEnabled, !Ref BackupArchiveCleanup, 'disabled']
           MailPasswordBase64:
             Fn::Base64: !Ref MailPassword
 
@@ -1349,6 +1924,7 @@ Resources:
         - |
           #!/bin/bash
           BOOTSTRAP_RESOURCE=DatabaseInstance
+          # Backup cleanup: ${ArchiveCleanup}
           BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
           ${BootstrapScript}
 
@@ -1469,14 +2045,17 @@ Resources:
           fi
           BOOTSTRAP_STAGE=configuration
 
+          install_backup_archive '${EnableBackupArchive}' '${AWS::Region}' '${AWS::StackId}' \
+            '${ArchiveBucket}' banco
           aws ssm put-parameter \
             --region '${AWS::Region}' \
             --name '/${EnvironmentName}/database/ready' \
             --type String \
             --value '${AWS::StackId}' \
             --overwrite
-
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+          ArchiveBucket: !If [BackupArchiveEnabled, !Ref BackupArchiveBucket, '']
+          ArchiveCleanup: !If [BackupArchiveEnabled, !Ref BackupArchiveCleanup, 'disabled']
 
   DatabaseDataVolumeAttachment:
     Type: AWS::EC2::VolumeAttachment
@@ -1747,6 +2326,7 @@ Resources:
         - |
           #!/bin/bash
           BOOTSTRAP_RESOURCE=DatabaseStandbyInstance
+          # Backup cleanup: ${ArchiveCleanup}
           BOOTSTRAP_SIGNAL_URL='${BootstrapSignalHandle}'
           ${BootstrapScript}
 
@@ -1917,12 +2497,16 @@ Resources:
           TIMER
           systemctl daemon-reload
           systemctl enable --now codetracker-database-backup.timer codetracker-database-failover.timer
+          install_backup_archive '${EnableBackupArchive}' '${AWS::Region}' '${AWS::StackId}' \
+            '${ArchiveBucket}' banco
           BOOTSTRAP_STAGE=database-standby-ready
           aws ssm put-parameter \
             --region '${AWS::Region}' --name '/${EnvironmentName}/database/standby-ready' \
             --type String --value '${AWS::StackId}' --overwrite
           BOOTSTRAP_STAGE=configuration
         - BootstrapScript: !FindInMap [Bootstrap, Common, Script]
+          ArchiveBucket: !If [BackupArchiveEnabled, !Ref BackupArchiveBucket, '']
+          ArchiveCleanup: !If [BackupArchiveEnabled, !Ref BackupArchiveCleanup, 'disabled']
 
   DatabaseStandbyDataVolumeAttachment:
     Type: AWS::EC2::VolumeAttachment
@@ -2149,6 +2733,26 @@ Resources:
           TargetGroupArn: !Ref WebTargetGroup
 
 Outputs:
+  BackupGpgSecretArn:
+    Condition: BackupArchiveEnabled
+    Description: Custodia GPG (privada e senha); excluida junto com a stack.
+    Value: !Ref BackupGpgSecret
+
+  BackupPublicKeyS3Uri:
+    Condition: BackupArchiveEnabled
+    Description: Chave publica gerada automaticamente; fingerprint em keys/fingerprint.txt.
+    Value: !Sub 's3://${BackupArchiveBucket}/keys/grupo7-publica.asc'
+
+  BackupArchiveBucketName:
+    Condition: BackupArchiveEnabled
+    Description: Bucket privado de backups e logs; esvaziado e excluido junto com a stack.
+    Value: !Ref BackupArchiveBucket
+
+  BackupArchiveS3Uri:
+    Condition: BackupArchiveEnabled
+    Description: Prefixo dos pacotes GPG; custodia privada no segredo identificado por BackupGpgSecretArn.
+    Value: !Sub 's3://${BackupArchiveBucket}/backups/'
+
   ApplicationUrl:
     Description: URL HTTP publica do Application Load Balancer.
     Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'

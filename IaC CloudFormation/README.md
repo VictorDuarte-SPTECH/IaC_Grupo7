@@ -1,5 +1,191 @@
 # Deploy da aplicacao com CloudFormation e Docker Swarm
 
+## Carga da infraestrutura principal pelo ALB
+
+Para a stack principal `cloudformationCodeTracker.yaml`, use o plano
+[`atividade-tres-grupos.jmx`](../Testes%20Infra/atividade-tres-grupos.jmx),
+com grupos sequenciais de **2, 20 e 100 usuarios**, pelo DNS do output
+`ApplicationUrl`, porta 80 e rotas `/api/...`.
+Consulte as [instrucoes de execucao e comprovacao do balanceamento](../Testes%20Infra/README.md),
+incluindo cookies/HTTPS, access logs do ALB e limites da medicao.
+Nao confunda este destino com o NLB da stack independente abaixo.
+
+## Backend e MySQL publicos para testes
+
+O template independente `cloudformation-backend-mysql-publico.yaml` adapta
+o de MySQL isolado: cria VPC nova, duas sub-redes publicas, uma unica EC2 com
+MySQL e o container do backend, e um NLB publico com listeners TCP 3306 e
+8080. O NLB usa balanceamento entre zonas, mas a unica VM continua sendo um
+ponto de falha. Nao cria frontend, RabbitMQ ou servico de etiquetas.
+
+Crie uma nova stack em regiao com duas AZs. Informe `KeyName`,
+`DatabasePassword`, `AdminPassword`, `MailUsername`, `MailPassword` e `JwtSecret` (Base64 com ao menos
+32 bytes aleatorios). Gere a chave pelo comando PowerShell da secao do
+template principal. Confira `DockerHubNamespace` e `ApplicationImageTag`:
+a imagem publica `codetracker-backend` deve existir na tag informada.
+O banco e importado do SQL do repositorio `Banco_Grupo7`, como na stack
+de MySQL isolado. O bootstrap so sinaliza sucesso apos o endpoint
+`/v3/api-docs` responder na VM; confira tambem os dois target groups no NLB.
+
+Para JMeter, use o output `BackendUrl` e a rota real do backend, por exemplo
+`http://DNS_DO_NLB:8080/usuarios/login`; nao acrescente o prefixo `/api` do
+proxy do frontend. O login cria um cookie `authToken`; configure um HTTP
+Cookie Manager no JMeter para usa-lo nas requisicoes autenticadas. A
+autenticacao do backend continua ativa. Para MySQL, use `MysqlHost`, porta
+3306, usuario e banco `lamar`, e a senha informada no deploy.
+
+### Plano JMeter da API
+
+O arquivo [`aula_11_11.jmx`](../../aula_11_11.jmx) usa JMeter 5.6.3, sem
+plugins adicionais. Testa o backend via NLB e exercita o MySQL pelas
+consultas da API; nao faz JDBC direto. Nao altera registros, nao envia
+emails nem solicita etiquetas. Nao valida failover ou alta disponibilidade:
+esta stack tem somente uma EC2.
+
+Escolha **um cenario por execucao** com `-Jcenario=...`:
+
+| Cenario | Usuarios simultaneos | Rampa (s) | Duracao maxima (s) |
+| --- | ---: | ---: | ---: |
+| `funcional` (padrao) | 1 | 1 | 60; uma iteracao |
+| `carga` | 20 | 30 | 300 |
+| `pico` | 60 | 5 | 120 |
+| `estresse` | 100 | 120 | 300 |
+| `resistencia` | 10 | 30 | 3600 |
+
+As duracoes incluem a rampa; os cenarios de desempenho repetem o fluxo ate
+o prazo. O pico representa subida rapida de concorrencia, nao uma curva
+com subida, queda e recuperacao. O estresse aumenta gradualmente os
+usuarios ate o patamar escolhido; execute novas rodadas com patamares
+maiores para investigar saturacao. Os valores sao pontos de partida,
+nao capacidade comprovada da EC2. O plano limita a 200 usuarios por
+processo; nao use geracao distribuida sem recalcular a carga total.
+Mantenha o JMeter fora da EC2 testada para nao disputar seus recursos.
+
+O funcional verifica OpenAPI, rejeicao HTTP 401 sem sessao, login,
+usuario logado, itens paginados, detalhe de um ID retornado pela listagem,
+categorias e logout seguido de nova rejeicao 401. Listagem vazia de itens
+(204 ou pagina vazia) e valida e pula o detalhe. Os demais cenarios repetem
+login e consultas autenticadas; cada usuario virtual preserva seu proprio
+cookie e renova o login 30 segundos antes da expiracao JWT. Todos usam a
+mesma conta de teste por padrao, portanto nao representam diversidade de
+usuarios/dados. Nenhuma senha invalida e enviada intencionalmente para
+evitar bloqueio da conta.
+
+Use o **DNS**, sem `http://`, porta ou `/api`, do output `BackendUrl`.
+Informe a senha `AdminPassword` do deploy pela variavel de ambiente
+`JMETER_PASSWORD`, nunca gravada no JMX. Exemplo PowerShell, executado
+na pasta que contem o plano, com `jmeter.bat` no PATH:
+
+```powershell
+$segredo = Read-Host 'Senha do usuario de teste' -AsSecureString
+$env:JMETER_PASSWORD = [System.Net.NetworkCredential]::new('', $segredo).Password
+$rodada = Get-Date -Format 'yyyyMMdd-HHmmss'
+try {
+    & jmeter.bat -n -t '.\aula_11_11.jmx' `
+        '-Jhost=DNS_DO_NLB' '-Jcenario=funcional' `
+        -l ".\resultado-$rodada.jtl" -j ".\jmeter-$rodada.log" `
+        -e -o ".\relatorio-$rodada"
+} finally {
+    Remove-Item Env:\JMETER_PASSWORD
+    Remove-Variable segredo
+}
+```
+
+Inicie pelo funcional. Depois altere apenas `-Jcenario=carga`, `pico`,
+`estresse` ou `resistencia`, usando arquivos/pastas novos por rodada.
+Outra conta pode ser selecionada com `-Jemail=...`.
+Nao execute carga contra ambientes compartilhados sem autorizacao.
+
+Parametros opcionais (sobrescrevem o perfil selecionado):
+
+| Propriedade `-J...` | Padrao / regra |
+| --- | --- |
+| `usuarios` | Do perfil; 1 a 200, funcional exige 1 |
+| `rampa_s`, `duracao_s` | Do perfil; duracao maior que rampa, ate 86400 s |
+| `pausa_ms`, `variacao_ms` | 500 + aleatorio entre 0 e 500 ms por requisicao |
+| `limite_resposta_ms` | 5000; assercao por requisicao, nao percentil |
+| `timeout_conexao_ms`, `timeout_resposta_ms` | 5000 e 10000 |
+| `protocolo`, `porta` | `http`, `8080`, conforme esta stack |
+
+O plano falha antes de acessar o destino se a configuracao for invalida.
+Status HTTP e formatos JSON sao validados, redirects nao sao aceitos
+como sucesso e falhas no login/cookie interrompem o teste para evitar
+uma tempestade de tentativas. Cookie `Secure` sobre HTTP gera erro
+explicito: habilite TLS ou, exclusivamente neste laboratorio, confira
+`COOKIE_SECURE=false` no backend; nao desative validacao de cookies.
+Uma falha de contrato pode indicar divergencia entre o codigo local
+e a tag Docker implantada.
+
+Nao ha listeners graficos ativos para evitar consumo de memoria no
+gerador. Abra o dashboard HTML gerado e compare erros, throughput,
+concorrencia, p95 e p99 por endpoint entre rodadas. As verificacoes de
+configuracao/login tambem aparecem no JTL; separe-as das consultas na
+analise. O JMeter pode retornar codigo de processo zero mesmo com
+amostras reprovadas: confira a coluna `success`, as falhas de assercao e
+o relatorio, nao apenas o exit code. Nao ha criterio agregado automatico
+de aprovacao por taxa de erros ou percentil; defina o SLA do experimento.
+Nao habilite gravacao de corpos/headers de requisicao ou resposta nos
+resultados: podem conter senha, cookie e dados da aplicacao.
+
+Durante os testes, acompanhe CPU e creditos CPU (`CPUCreditBalance`) da
+EC2, conexoes/targets do NLB e, na VM, memoria, logs do backend, pool JDBC,
+conexoes e consultas lentas do MySQL. O plano nao coleta essas metricas
+nem configura agentes de monitoramento. Pare a carga diante de OOM,
+indisponibilidade ou esgotamento dos creditos. Passe no funcional antes
+de aumentar concorrencia.
+
+**Somente testes:** SSH (22), MySQL (3306) e backend (8080) ficam publicos
+para qualquer IPv4, tambem diretamente pelo IP da EC2. HTTP nao criptografa
+as credenciais e o template nao configura TLS no NLB. Nao use dados reais.
+Sem RabbitMQ, publicacoes de etiquetas falham; sem o consumer, etiquetas nao
+sao geradas. A imagem exige configuracao SMTP mesmo para iniciar; no Gmail,
+use uma senha de app sem os espacos de apresentacao em `MailPassword`.
+O template nao agenda desligamento; EC2, NLB e disco geram custos.
+Exclua a stack ao terminar. Excluir/substituir a EC2 apaga o disco e os dados.
+Senhas e JWT estao no UserData: `NoEcho` nao protege seu conteudo.
+
+Para investigar falhas, preserve os recursos ao criar a stack e consulte
+EC2 > Actions > Monitor and troubleshoot > Get system log, ou por SSH:
+
+```bash
+sudo tail -n 100 /var/log/backend-mysql-bootstrap.log
+sudo docker logs --tail 100 codetracker-backend
+```
+
+Logs podem conter dados sensiveis; revise-os antes de compartilhar. Mudancas
+no UserData de uma EC2 existente nao reexecutam seu bootstrap.
+
+## MySQL publico isolado para testes
+
+O template independente `cloudformation-mysql-publico.yaml` cria uma VPC,
+duas sub-redes publicas, uma EC2 Ubuntu com MySQL e um Network Load Balancer
+publico TCP na porta 3306. O NLB usa balanceamento entre zonas para alcancar
+a unica EC2; **isso nao fornece alta disponibilidade**. Nao cria frontend,
+backend, RabbitMQ ou a infraestrutura da stack principal.
+
+Crie uma nova stack CloudFormation numa regiao com duas AZs. Informe `KeyName`
+(par de chaves existente), `DatabasePassword` (usuario `lamar`) e
+`AdminPassword` (senha inicial do administrador da aplicacao importado).
+O bootstrap importa `SCRIPT-Lamar-AutoPecas.sql` do repositorio publico
+`Banco_Grupo7`, configura o usuario MySQL e o administrador como no template
+principal. Aguarde `CREATE_COMPLETE` e verifique em EC2 > Target Groups que o
+target esta `healthy`. No cliente MySQL, use os outputs `MysqlHost`, porta
+3306, banco `lamar` e usuario `lamar`.
+
+**Somente para testes:** SSH e MySQL da EC2 e MySQL do NLB aceitam qualquer
+IPv4. O banco tambem pode ser acessado diretamente pelo IP publico da EC2.
+O trafego do NLB e TCP, nao configura TLS: nao envie dados ou credenciais
+reais. O IP publico da EC2 pode mudar apos stop/start. Para diagnosticar,
+consulte EC2 > Actions > Monitor and troubleshoot > Get system log, ou
+`sudo tail -n 100 /var/log/mysql-bootstrap.log` por SSH. Em caso de falha,
+preservar recursos na criacao da stack permite consultar a EC2.
+
+EC2, IPv4, NLB e disco geram custos. Excluir ou substituir a EC2 exclui o
+disco e os dados; nao ha backup. A senha e incluida no UserData da EC2:
+`NoEcho` nao protege seu conteudo. Nao publique o UserData ou os logs. Depois
+dos testes, exclua a stack; recursos preservados apos falha tambem geram
+custos. Nao ha agendamento automatico para desligar esta stack.
+
 ## Versao de custo minimo (stack separada)
 
 O template `cloudformationCodeTracker-economica.yaml` e uma alternativa para
@@ -415,6 +601,13 @@ imagens: elas sao fornecidas na criacao da stack.
 
 ## 2. Criar uma stack nova
 
+No console, os parametros do template principal sao organizados em oito
+grupos pelo recurso padrao `AWS::CloudFormation::Interface`: ambiente e
+acesso, capacidade e sistema operacional, imagens, MySQL, autenticacao,
+RabbitMQ, e-mail/etiquetas e backup. Os nomes/titulos dos parametros,
+descricoes, valores padrao e validacoes permanecem inalterados.
+O agrupamento afeta somente a apresentacao no console, nao os comandos CLI.
+
 Esta versao altera a topologia e foi preparada para uma stack nova. Atualizar
 somente o template de uma stack existente nao garante instalar a AWS CLI,
 instalar os brokers nos backends, configurar o manager unico ou atualizar as
@@ -568,6 +761,17 @@ antes de tentar novamente; nao trate uma stack em rollback como implantada.
 Se houver dados a preservar, faca backup antes de excluir qualquer stack.
 
 ### O que acontece durante o bootstrap
+
+Para respeitar o limite EC2 de **16384 bytes de UserData decodificado**, o
+manager baixa `StackCompose` e `WorkerSetupScript` de seu proprio Metadata
+no CloudFormation antes de instalar/publicar os servicos. O instance profile
+precisa de `cloudformation:DescribeStackResource` tambem para
+`SwarmManagerInstance`, mesmo com backup desabilitado. Nenhum valor de Docker
+secret foi movido para esses metadados. Falha de download ou sintaxe do script
+interrompe o bootstrap. Os testes medem o UserData em bytes **apos** substituir
+parametros, inclusive senha SMTP longa, ARN realista da stack e backup ligado
+ou desligado; medir somente os placeholders nao reproduz o tamanho recebido
+pela EC2.
 
 O manager AZ1 publica `/<EnvironmentName>/swarm/stack-id` somente depois do IP,
 do token de worker e da criacao dos secrets. Os workers so usam
@@ -740,6 +944,352 @@ Depois da promocao, o agente para de copiar dados da AZ2 e nao retorna a ela
 automaticamente. Nunca reinicie o banco antigo como principal: ele estara
 desatualizado. Retomar a redundancia exige reconstruir um standby a partir
 do banco ativo, sem sobrescrever os dados novos da AZ1.
+
+### Arquivamento criptografado da politica de backup (novas stacks)
+
+O template principal pode provisionar um **novo bucket S3 privado** e instalar
+GPG, cron e `/usr/local/sbin/codetracker-backup-archive` no manager e nas duas
+EC2 MySQL. Isto e adicional aos timers de copia de 12 horas e de failover:
+esses timers e seu funcionamento nao sao substituidos.
+
+Esta automacao e voltada a **novas criacoes** da stack. Alterar UserData ou os
+parametros em uma stack existente nao reinstala os scripts nas EC2.
+Nao exclua/recrie a stack atual para aplicar isto sobre dados existentes:
+faca primeiro um plano de migracao e backups recuperaveis.
+O recurso nao depende do Access Point usado no procedimento manual.
+
+#### Parametro e geracao automatica da chave
+
+Para habilitar, basta definir **`EnableBackupArchive=true`** na criacao,
+alem dos parametros usuais da infraestrutura. O padrao continua `false` para
+nao exigir novos servicos/permissoes de quem nao utiliza o arquivamento.
+Nao ha mais parametros de URI ou fingerprint nem necessidade de gerar ou
+enviar chaves manualmente antes do deploy.
+
+Com o recurso habilitado:
+
+1. CloudFormation cria um segredo `BackupGpgSecret` no Secrets Manager,
+   inicialmente com uma senha aleatoria de 64 caracteres.
+2. No bootstrap, o bastion gera um par RSA 4096 com subchave de criptografia.
+   O chaveiro transitorio e criado em `/dev/shm` (tmpfs), nao no disco raiz.
+   A chave privada e protegida pela senha; privada, publica, fingerprint e senha
+   sao persistidos como JSON no Secrets Manager, protegido pela chave padrao
+   do servico. Eles nao aparecem em parametros, outputs ou logs de comandos.
+3. **Depois de persistir a custodia**, o bastion publica apenas
+   `keys/grupo7-publica.asc` e `keys/fingerprint.txt` no novo bucket.
+4. As EC2 de banco e manager aguardam a publicacao por ate 20 minutos,
+   conferem o fingerprint e rejeitam material privado/varias chaves antes
+   de importar somente a publica em `/etc/codetracker-backup/gnupg`.
+5. O agente GPG e encerrado e os arquivos temporarios de custodia sao
+   removidos ao sair do provisionador, inclusive em erros normais. Uma queda
+   abrupta do processo pode deixar temporarios em RAM ate o reboot.
+
+Uma chave e gerada **por nova stack**, nao por backup, reboot ou atualizacao.
+Se o provisionador for reexecutado e o segredo ja contiver um par, reutiliza-o;
+nao troca automaticamente a chave por falha de publicacao no S3 nem por
+custodia incompleta. Nao altere `GenerateSecretString` nem apague o segredo
+manualmente: os backups antigos dependem da custodia antiga.
+As chaves automaticas nao expiram; rotacao e revogacao exigem um plano que
+preserve a recuperacao dos arquivos existentes.
+
+O segredo e o bucket tem `DeletionPolicy` e `UpdateReplacePolicy` **Delete**.
+**Excluir a stack apaga os backups, todas as versoes dos objetos e a chave
+privada com sua senha**, inclusive em rollback de criacao. Se precisar
+preservar dados, exporte e teste uma copia externa antes de excluir.
+Uma nova stack cria outro par e outro segredo.
+O output **`BackupGpgSecretArn`** identifica a custodia; o output
+`BackupPublicKeyS3Uri` identifica o objeto publico (nao e mais parametro).
+Recomenda-se manter tambem custodia externa criptografada para recuperar
+sem acesso a conta AWS. A senha e a privada estao no mesmo segredo: quem
+puder le-lo tem capacidade de recuperar os backups.
+
+O instance profile continua sendo **externo**, informado em
+`InstanceProfileName` (por exemplo, `LabInstanceProfile`). O template nao cria
+roles nem modifica o profile do laboratorio. Antes de criar a stack, confirme
+com o administrador que ele permite:
+
+- `s3:PutObject`, `s3:GetObject` e `s3:AbortMultipartUpload` em
+  `backups/*` e `logs/*` do novo bucket;
+- `s3:PutObject` em `keys/*` no bastion e `s3:GetObject` em `keys/*`
+  nos hosts de backup;
+- `secretsmanager:GetSecretValue` e `secretsmanager:PutSecretValue` no novo
+  segredo, para o bastion provisionar/reutilizar a chave;
+- `cloudformation:DescribeStackResource` na stack, inclusive no logical ID
+  `BootstrapSignalHandle`, que disponibiliza instalador e gerador em Metadata.
+
+A identidade que cria a stack tambem precisa poder criar/configurar o segredo
+e o bucket, excluir o segredo e passar a role da Lambda de limpeza.
+O parametro `BackupCleanupRoleName` (padrao `LabRole`) identifica uma role
+**existente**, com trust em `lambda.amazonaws.com`, como na stack do data lake.
+Essa role precisa de `s3:ListBucket`, `s3:ListBucketVersions`,
+`s3:ListBucketMultipartUploads`, `s3:DeleteObject`, `s3:DeleteObjectVersion`
+e `s3:AbortMultipartUpload` no bucket/objetos correspondentes, alem de
+`logs:CreateLogStream` e `logs:PutLogEvents` no log group da funcao.
+Nao confunda o nome da role com `InstanceProfileName`. O template nao cria
+nem exclui essas identidades externas.
+Secrets Manager tem custo e pode nao ser permitido pelo
+AWS Academy/LabRole: nesse caso o recurso falha explicitamente; nao e
+contornado guardando a privada em S3.
+O template reutiliza o **mesmo instance profile em todas as EC2**; por isso,
+embora so o bastion leia/escreva a privada no fluxo normal, nao ha isolamento
+IAM da custodia entre hosts com esse profile. Para producao, separe as roles
+do provisionador, dos hosts de backup e dos operadores de recuperacao.
+O segredo padrao nao fornece isolamento de conta/regiao.
+
+O novo bucket usa SSE-S3, alem do GPG aplicado antes do upload.
+Para restauracao/listagem por operadores, autorize separadamente
+`s3:ListBucket` no bucket e `s3:GetObject` nos objetos.
+Politicas restritas devem prever bucket e segredo gerados pela nova stack antes
+do bootstrap; se o laboratorio nao autorizar isso, nao habilite o recurso ate
+ajustar as permissoes. Nunca resolva `AccessDenied` tornando o bucket publico.
+
+#### Execucao, destinos e verificacao
+
+O primeiro backup e executado no bootstrap. Uma falha de chave, dump ou
+transferencia faz o bootstrap falhar, em vez de sinalizar sucesso sem copia.
+O manager so inicia o servico que sinaliza sua prontidao depois dessa etapa.
+O standby ainda nao promovido envia um log de operacao ignorada, sem dump:
+durante sua restauracao periodica, `read_only` e temporariamente desabilitado,
+portanto so verificar essa variavel nao bastaria para identificar o principal.
+Apos a promocao concluida, o mesmo cron no standby arquiva o novo banco ativo.
+Nao existe nova copia externa automatica **imediata** no instante do failover:
+se necessario, execute o comando abaixo no novo principal antes do proximo cron.
+
+O arquivo `/etc/cron.d/codetracker-backup-archive` executa domingo e quarta
+as **02:00 no fuso do host** (UTC na AMI Ubuntu da stack):
+
+```cron
+0 2 * * 0,3 root /usr/bin/timeout --signal=TERM --kill-after=60s 3h /usr/local/sbin/codetracker-backup-archive
+```
+
+O intervalo nominal maximo de quatro dias deixa margem para o **RPO de sete
+dias (604800 segundos)**. Cron nao repoe execucoes perdidas com a VM desligada.
+Falhas, duracao e indisponibilidade podem violar o RPO; agendamento nao e prova
+de cumprimento. Nao execute DDL, deploy ou alteracoes de configuracao durante
+a coleta. O dump usa `--single-transaction` e recusa tabelas nao InnoDB.
+
+Consulte os outputs `BackupArchiveBucketName` e `BackupArchiveS3Uri`:
+
+```text
+EC2 MySQL ativa                         Manager
+  /var/lib/mysql (EBS de dados)           /opt/codetracker/stack.yml
+         | mysqldump                               | tar
+         v                                        v
+  /bckp/db/ID/                            /bckp/app/ID/
+         | GPG + SHA-256 + HTTPS                   |
+         +-------------------+--------------------+
+                             v
+                    Novo bucket S3 privado
+  backups/HOST/banco/ID/       backups/HOST/app/ID/
+    backup.tar.gz.gpg            backup.tar.gz.gpg
+    original.sha256             original.sha256
+    checksum.sha256             checksum.sha256
+    SUCESSO-S3.txt               SUCESSO-S3.txt
+  logs/HOST/banco/ID.log       logs/HOST/app/ID.log
+
+Custodia privada + senha: Secrets Manager, fora do bucket; excluido com a stack.
+Bastion: geracao transitoria em RAM; demais hosts recebem somente a publica.
+```
+
+O pacote do banco contem `lamar.sql`, `mysql-version.txt`, `snapshot.txt`
+e `conteudo.sha256`. O pacote da aplicacao contem `app.tar.gz` (configuracao
+em `/opt/codetracker`), `snapshot.txt` e `conteudo.sha256`.
+O manifesto `original.sha256` permite conferir `backup.tar.gz` apos descriptografar.
+`checksum.sha256` protege os bytes cifrados e o manifesto original.
+O script baixa novamente os objetos enviados e compara todos os bytes com a
+origem. So publica `SUCESSO-S3.txt` e atualiza o marcador local depois disso.
+Hash/comparacao detectam alteracao na transferencia; nao substituem controle
+IAM, autenticidade da origem ou teste de importacao.
+
+SQL e pacotes intermediarios em claro ficam em `.work-*`, root-only, e sao
+removidos ao terminar, inclusive em falhas normais. Interrupcao abrupta,
+`SIGKILL` ou perda da VM pode deixar temporarios. Reserve disco para dump
+sem compressao, pacote compactado e download de verificacao; controle
+capacidade antes de habilitar o recurso. Exclusao nao equivale a apagamento
+seguro. As copias locais finais contem apenas GPG e metadados.
+
+O bucket bloqueia acesso publico, desabilita ACLs, exige HTTPS, habilita
+versionamento e **e esvaziado e excluido com a stack**. Nao ha expiracao
+automatica de backups: revise mensalmente e mantenha ao menos seis semanas,
+sem apagar a ultima copia valida. Versoes nao atuais tambem ocupam espaco e
+geram custos. Somente uploads multipart incompletos sao abortados apos sete
+dias. Isso **nao e Object Lock** nem garantia contra exclusao por um operador.
+As copias locais tambem exigem revisao/limpeza administrativa; logs locais
+possuem rotacao semanal. Nao publique SQL, configuracoes ou logs com dados
+reais nas evidencias.
+
+Na exclusao, as EC2 produtoras sao encerradas antes do custom resource de
+limpeza. A Lambda remove lotes de versoes, delete markers e objetos sem
+versao, aborta uploads multipart e entao libera a exclusao do bucket pelo
+CloudFormation. O segredo, a Lambda e seu log group tambem sao excluidos.
+Na substituicao do bucket, a limpeza esvazia o bucket antigo, nao o novo.
+Nao habilite Object Lock e pare gravacoes externas antes de excluir.
+Sem permissoes, diante de erros parciais ou se a limpeza exceder a janela
+de 15 minutos, o recurso retorna falha explicita: corrija e repita a exclusao,
+em vez de ignorar o recurso. A exclusao do segredo pelo CloudFormation nao
+oferece janela de recuperacao; nao dependa de recuperar a privada depois.
+
+**Stacks antigas:** recursos que ja ficaram como `DELETE_SKIPPED`/Retain
+nao voltam ao controle de uma nova stack por carregar este template.
+Exclua-os separadamente pelo console, depois de conferir o bucket e o ARN
+exatos. Para buckets versionados, apague tambem todas as versoes e delete
+markers. Nao exclua recursos de outra stack ou buckets compartilhados.
+O fluxo automatico vale para recursos gerenciados por uma stack que recebeu
+esta versao do template antes da exclusao.
+
+Para o banco, ha original em EBS de dados, arquivo local em outro volume
+(raiz da EC2) e arquivo em object storage S3: tres exemplares e duas
+tecnologias, com um destino fora das EC2. Isso nao implica outra regiao ou
+outra conta. Para configuracao do manager, original e arquivo local ainda
+compartilham o disco raiz: se for exigida independencia fisica para cada
+conjunto da aplicacao, acrescente um destino/disco independente. Nao declare
+protecao geografica completa, 3-2-1-1-0 ou recuperacao integral dos servicos
+somente com esses arquivos.
+
+**Fora do escopo:** mensagens/configuracao dos dois RabbitMQ, conteudo dos
+Docker secrets, usuarios/grants globais do MySQL, imagens Docker completas
+e sistema operacional. Preserve senhas, JWT e SMTP em cofre externo para
+recriar os secrets; `docker secret inspect` nao exporta os valores.
+A stack e o registro de imagens permitem reconstruir servicos, mas
+isso nao restaura mensagens de fila. O banco do registro de idempotencia,
+se estiver no schema `lamar`, entra no dump; H2 em memoria nao entra.
+
+#### Operacao e evidencia de RPO
+
+Em cada host participante:
+
+```bash
+sudo /usr/local/sbin/codetracker-backup-archive
+sudo cat /etc/cron.d/codetracker-backup-archive
+sudo ls -lt /bckp/logs
+sudo cat /etc/codetracker-backup/ultimo-sucesso.txt
+```
+
+O log local e enviado ao S3 tambem em falha do dump/upload. Se o proprio envio
+de log falhar, ele permanece em `/bckp/logs` e a falha e registrada no syslog
+com identificador `codetracker-backup`; nao ha retry persistente de logs.
+O comando retorna erro em falha de backup ou envio de log. Falhas anteriores
+a criacao do log (por exemplo, lock ocupado) aparecem no stderr do cron.
+
+O responsavel deve conferir diariamente o ultimo snapshot valido e os dois
+destinos. No banco ativo, este comando verifica a idade e alerta a partir de
+seis dias, deixando margem antes dos sete:
+
+```bash
+sudo bash -c '
+  set -euo pipefail
+  snapshot=$(cat /etc/codetracker-backup/ultimo-sucesso.txt)
+  age=$(( $(date +%s) - $(date -d "$snapshot" +%s) ))
+  printf "IDADE_SNAPSHOT_SEGUNDOS=%s\n" "$age"
+  if (( age < 0 || age >= 518400 )); then
+    echo "ALERTA: verificar relogio ou executar copia antes de 604800 segundos" >&2
+    exit 1
+  fi
+'
+```
+
+Nao e enviado email/SNS por este recurso. Integre erros e ausencia de sucesso
+ao monitoramento do grupo. No incidente, avalie a idade do snapshot **remoto
+recuperavel**, nao apenas a data do ultimo log. No standby nao promovido,
+a ausencia de marcador de arquivamento e esperada.
+
+#### Teste de restauracao cronometrado
+
+Execute apos o deploy e mensalmente, em **VM isolada de recuperacao**, nunca
+no MySQL principal/standby. A VM precisa de AWS CLI autenticada com leitura
+no bucket, GPG, Docker e acesso a uma imagem MySQL compativel. Os pacotes
+desta automacao diferem dos arquivos `.sql.gz.gpg` do procedimento manual.
+Nao use o script antigo de restauracao Compose para estes pacotes.
+
+Escolha um prefixo de banco com `SUCESSO-S3.txt`. Prepare um diretorio vazio
+privado em disco criptografado. Um operador autorizado recupera o segredo
+indicado no output `BackupGpgSecretArn`; nao use a EC2 de producao nem
+publique esse JSON ou a chave privada nas evidencias.
+O JSON baixado contem **a privada e a senha**, portanto deve ser tratado como
+credencial de recuperacao. O comando abaixo nao exibe o conteudo no terminal:
+
+```bash
+umask 077
+mkdir -m 700 "$HOME/restauracao-ARQUIVO-UNICO"
+cd "$HOME/restauracao-ARQUIVO-UNICO"
+aws secretsmanager get-secret-value \
+  --secret-id ARN_DO_OUTPUT_BackupGpgSecretArn \
+  --region us-east-1 --query SecretString --output text > custodia.json
+python3 -c 'import json; from pathlib import Path; s=json.loads(Path("custodia.json").read_text()); Path("grupo7-privada.asc").write_text(s["private_key"]); print("Fingerprint da custodia:", s["fingerprint"])'
+export GNUPGHOME="$PWD/chaveiro"
+mkdir -m 700 "$GNUPGHOME"
+export GPG_TTY=$(tty)
+gpg --import grupo7-privada.asc
+
+set -euo pipefail
+INICIO=$(date +%s)
+aws s3 cp s3://BUCKET/backups/HOST/banco/ID/ . --recursive
+test -s SUCESSO-S3.txt
+sha256sum --check checksum.sha256
+gpg --output backup.tar.gz --decrypt backup.tar.gz.gpg
+sha256sum --check original.sha256
+tar --no-same-owner -xzf backup.tar.gz \
+  lamar.sql mysql-version.txt snapshot.txt conteudo.sha256
+sha256sum --check conteudo.sha256
+cat mysql-version.txt
+```
+
+No dialogo do GPG, informe o campo `passphrase` do mesmo segredo, consultado
+com acesso restrito pelo console Secrets Manager (nao cole em comandos,
+prints ou chats). Use a regiao real da stack no comando acima.
+Custodia externa existente pode substituir a recuperacao via Secrets Manager.
+
+Use uma imagem da mesma versao do MySQL exibida (na AMI Ubuntu 24.04, normalmente
+8.0; confirme a versao real). Depois de selecionar explicitamente a imagem,
+continue na mesma sessao Bash:
+
+```bash
+IMAGEM=mysql:VERSAO_COMPATIVEL
+CID=$(docker create --network none -e MYSQL_ALLOW_EMPTY_PASSWORD=yes "$IMAGEM")
+trap 'docker rm -fv "$CID" >/dev/null' EXIT
+docker start "$CID" >/dev/null
+ready=0
+for attempt in $(seq 1 90); do
+  if docker exec "$CID" mysqladmin --protocol=TCP -h 127.0.0.1 ping --silent >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+if [ "$ready" != 1 ]; then
+  docker logs --tail 50 "$CID"
+  echo "ERRO: MySQL de teste indisponivel" >&2
+  exit 1
+fi
+docker exec -i "$CID" mysql -u root < lamar.sql
+docker exec "$CID" mysqlcheck -u root --check lamar
+docker exec "$CID" mysql -u root lamar -e \
+  "SELECT COUNT(*) AS itens FROM item; SELECT COUNT(*) AS usuarios FROM usuario;"
+printf 'TEMPO_RESTAURACAO_DADOS_SEGUNDOS=%s\n' "$(( $(date +%s) - INICIO ))"
+docker rm -fv "$CID"
+trap - EXIT
+```
+
+Registre o tempo real e os hashes. Essa medicao inclui download,
+descriptografia, preparo da imagem/container e importacao/verificacao, mas
+nao inclui provisionar a VM nem importar a chave. O RTO da aplicacao inteira
+exige tambem recriar secrets, subir os servicos e validar login/estoque/fluxos
+de negocio; nao foi medido por essa rotina. Para a configuracao do manager,
+baixe um pacote `app`, confira/descriptografe da mesma forma e extraia
+`app.tar.gz` em um diretorio isolado, nunca sobre a producao.
+Remova com cuidado os diretorios exatos de teste e o chaveiro temporario
+depois da aprovacao: eles contem dados e segredos em claro.
+
+Validacao offline do recurso:
+
+```powershell
+python -m unittest discover -s '.\IaC_Grupo7\IaC CloudFormation\tests' -p 'backup_archive_test.py'
+cfn-lint '.\IaC_Grupo7\IaC CloudFormation\cloudformationCodeTracker.yaml'
+```
+
+Os testes executam shell/tar/SHA-256 reais com AWS, MySQL e GPG simulados,
+incluindo geracao unica, reutilizacao e custodia anterior a publicacao;
+nao comprovam permissoes AWS, criptografia real nem tempos de recuperacao.
 
 ## 4. Subir o monitoramento opcional
 

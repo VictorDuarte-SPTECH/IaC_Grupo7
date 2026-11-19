@@ -95,9 +95,9 @@ done
 
 manager_service=$(awk '
   { sub(/\r$/, "") }
-  /^          cat > \/usr\/local\/sbin\/label-swarm-workers <<'\''SCRIPT'\''/ { extracting = 1; next }
-  extracting && /^          SCRIPT$/ { exit }
-  extracting { sub(/^          /, ""); sub(/\r$/, ""); print }
+  /^      WorkerSetupScript: !Sub \|/ { extracting = 1; next }
+  extracting && NF && !/^        / { exit }
+  extracting { sub(/^        /, ""); sub(/\r$/, ""); print }
 ' "$template")
 [[ -n "$manager_service" ]]
 printf '%s\n' "$manager_service" | bash -n
@@ -275,8 +275,8 @@ done
 
 etiquetas_service=$(awk '
   { sub(/\r$/, "") }
-  /^            etiquetas:$/ { extracting = 1 }
-  extracting && /^            frontend:$/ { exit }
+  /^          etiquetas:$/ { extracting = 1 }
+  extracting && /^          frontend:$/ { exit }
   extracting { print }
 ' "$template")
 [[ "$etiquetas_service" == *'replicas: 2'* ]]
@@ -319,8 +319,8 @@ printf 'PASS: manager unico e oito EC2, sem hosts RabbitMQ dedicados\n'
 
 backend_service=$(awk '
   { sub(/\r$/, "") }
-  /^            backend:$/ { extracting = 1 }
-  extracting && /^            etiquetas:$/ { exit }
+  /^          backend:$/ { extracting = 1 }
+  extracting && /^          etiquetas:$/ { exit }
   extracting { print }
 ' "$template")
 [[ "$backend_service" == *'replicas: 4'* ]]

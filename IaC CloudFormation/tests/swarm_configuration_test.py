@@ -129,7 +129,9 @@ class SwarmConfigurationTests(unittest.TestCase):
 
     def test_compose_uses_backend_brokers_and_keeps_replicas(self):
         script = self.script("SwarmManagerInstance")
-        compose = yaml.safe_load(script.split("<<'STACK'\n", 1)[1].split("\nSTACK", 1)[0])
+        compose = yaml.safe_load(self.renderer.render(
+            self.template["Resources"]["SwarmManagerInstance"]["Metadata"]["StackCompose"]
+        ))
         services = compose["services"]
         self.assertEqual(services["backend"]["deploy"]["replicas"], 4)
         self.assertEqual(services["backend"]["deploy"]["placement"]["max_replicas_per_node"], 2)
@@ -140,8 +142,40 @@ class SwarmConfigurationTests(unittest.TestCase):
         self.assertEqual(services["backend"]["environment"]["SPRING_RABBITMQ_ADDRESSES"], "10.0.0.100:5672,10.0.0.116:5672")
         self.assertIn("rabbitmq_password", compose["secrets"])
         self.assertIn("rabbitmq_password", {mount["source"] for mount in services["backend"]["secrets"]})
-        workers = script.split("<<'NODES'\n", 1)[1].split("\nNODES", 1)[0].splitlines()
+        worker_script = self.renderer.render(
+            self.template["Resources"]["SwarmManagerInstance"]["Metadata"]["WorkerSetupScript"]
+        )
+        workers = worker_script.split("<<'NODES'\n", 1)[1].split("\nNODES", 1)[0].splitlines()
         self.assertEqual(len([line for line in workers if line.strip()]), 4)
+
+    def test_userdata_fits_after_realistic_and_long_parameter_substitution(self):
+        parameters = {
+            "AWS::StackId": "arn:aws:cloudformation:us-east-1:123456789012:stack/" + "s" * 128 + "/00000000-0000-0000-0000-000000000000",
+            "EnvironmentName": "e" * 25,
+            "DockerHubNamespace": "n" * 30,
+            "ApplicationImageTag": "t" * 128,
+            "MailUsername": "sender" + "m" * 200 + "@example.com",
+            "MailPassword": "x" * 4096,
+            "DatabasePassword": "d" * 128,
+            "RabbitMqPassword": "r" * 128,
+            "AdminPassword": "a" * 72,
+            "JwtSecret": "j" * 128,
+            "EtiquetaEmailDestinatario": "recipient" + "m" * 200 + "@example.com",
+            "BackupArchiveBucket": "b" * 63,
+            "BackupGpgSecret": "arn:aws:secretsmanager:us-east-1:123456789012:secret:" + "s" * 64,
+        }
+        for enabled in ("true", "false"):
+            renderer = Renderer(self.template, **parameters, EnableBackupArchive=enabled)
+            for name, resource in self.template["Resources"].items():
+                if resource["Type"] != "AWS::EC2::Instance":
+                    continue
+                with self.subTest(instance=name, archive=enabled):
+                    script = renderer.render(resource["Properties"]["UserData"]["Fn::Base64"])
+                    self.assertLessEqual(len(script.encode("utf-8")), 16384, name)
+        manager = self.script("SwarmManagerInstance")
+        self.assertIn('["WorkerSetupScript"]', manager)
+        self.assertNotIn("WORKERS_READY=false", manager)
+        self.assertIn("bash -n /usr/local/sbin/label-swarm-workers", manager)
 
     def test_only_backends_start_persistent_brokers_before_joining(self):
         for name, resource in self.template["Resources"].items():
@@ -233,7 +267,9 @@ class SwarmConfigurationTests(unittest.TestCase):
             self.assertIn("--memory 1g", script)
             self.assertIn("vm_memory_high_watermark {absolute,536870912}", script)
         script = self.script("SwarmManagerInstance")
-        services = yaml.safe_load(script.split("<<'STACK'\n", 1)[1].split("\nSTACK", 1)[0])["services"]
+        services = yaml.safe_load(self.renderer.render(
+            self.template["Resources"]["SwarmManagerInstance"]["Metadata"]["StackCompose"]
+        ))["services"]
         backend = services["backend"]["deploy"]
         etiquetas = services["etiquetas"]["deploy"]
         backend_mib = int(backend["resources"]["limits"]["memory"].removesuffix("M"))
